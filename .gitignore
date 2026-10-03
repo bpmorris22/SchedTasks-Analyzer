@@ -1,0 +1,29 @@
+# Case data & tool binaries must never be committed
+*.csv
+_Processed/
+Exported CSVs/
+Exported_CSVs/
+TaskCache/
+
+# RECmd (users download their own)
+RECmd/
+RECmd.exe
+RECmd.dll
+
+# local dev / state
+IOC.txt
+IOC.csv
+*.boot.log
+*.error.log
+*.settings.json
+*.log
+runinfo.json
+SPEC.md
+*-SPEC.md
+BUILD-NOTES.md
+manual-src/
+*.bak*
+
+# OS cruft
+Thumbs.db
+desktop.ini

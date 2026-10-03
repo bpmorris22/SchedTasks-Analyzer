@@ -1,0 +1,2472 @@
+<!doctype html>
+<html>
+<head>
+<meta http-equiv="x-ua-compatible" content="IE=edge">
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>SchedTasks Analyzer</title>
+<HTA:APPLICATION
+  ID="staHta"
+  APPLICATIONNAME="SchedTasks Analyzer"
+  BORDER="thick"
+  CAPTION="yes"
+  SCROLL="auto"
+  SINGLEINSTANCE="yes"
+  SHOWINTASKBAR="yes"
+  MAXIMIZEBUTTON="yes"
+  MINIMIZEBUTTON="yes"
+  INNERBORDER="no"
+  CONTEXTMENU="yes"
+  SELECTION="yes" />
+<!--
+  SchedTasks-Analyzer - Windows scheduled-task triage (persistence / lateral movement). Family member
+  of the DFIR-Artifact-Finder toolkit. No external parser for the task XML: this app parses it itself
+  (MSXML6). RECmd is used ONLY for the optional TaskCache registry cross-check.
+
+  Contracts VERIFIED 2026-10-03 against 17 Velociraptor collections (3,084 task files) + RECmd 2.0.0.0:
+
+  Task XML (Windows\System32\Tasks\...): extensionless, UTF-16 LE with BOM (FF FE), root
+    <Task version="1.x" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">. FSO unicode
+    mode (-1) returns the text with the BOM stripped. MSXML2.DOMDocument.6.0.loadXML() fails with
+    "Invalid at the top level of the document" if a leading U+FEFF is left on - strip it (and the
+    <?xml?> declaration). Velociraptor writes a leading "." in a name as %2E. Deepest collected path
+    301 chars (> MAX_PATH) - every root is robocopy-staged to %TEMP% before parsing.
+
+  TaskCache (RECmd -f SOFTWARE --bn <embedded .reb> --csv <dir>):
+    <stamp>_RECmd_Batch_<reb>_Output.csv  HivePath,HiveType,Description,Category,KeyPath,ValueName,
+      ValueType,ValueData,ValueData2,ValueData3,Comment,Recursive,Deleted,LastWriteTimestamp,PluginDetailFile
+      Category TaskCacheTree    -> Tree\<task path>: Id / Index / SD ("(Binary data)"); Deleted=True
+                                   rows are keys recovered from hive slack (deleted tasks).
+      Category TaskCacheActions -> Tasks\{GUID}\Actions as dashed hex (IncludeBinary: true).
+    <stamp>\<stamp>_TaskCache__SOFTWARE.csv (plugin)  Version,BatchKeyPath,KeyName,BatchValueName,Path,
+      CreatedOn,LastStart,LastStop,TaskState,LastActionResult,Source,Description,Author  (times UTC)
+    Actions blob: u16 version (2 or 3), u32 len + UTF-16 context (principal id), then per action a u16
+      magic - 0x6666 Exec: id, command, arguments, workdir (each u32 len + UTF-16), v3 adds a u16
+      trailer; 0x7777 ComHandler: id, 16-byte CLSID, data; 0x8888 SendEmail / 0x9999 ShowMessage.
+    Stale Microsoft Tree leaves (Index 0, no Tasks key, no XML) are normal upgrade leftovers.
+
+  Times: files extracted from a Velociraptor offline-collector ZIP carry the ANALYSIS box's timezone
+    error (DOS zip times; seen -10:00 on a UTC+10 box). The collection's own
+    results\Windows.Triage.Targets%2FAll Matches Metadata.json holds the true UTC Created/Modified per
+    file - preferred, then the TaskCache Tree key LastWrite, then the extracted file time (labelled).
+-->
+<style>
+  html{margin:0;height:100%;background:#0d1117;overflow-x:hidden}   /* the zoom-compensated #content width (111%) makes IE show a bogus page-level horizontal scrollbar; wide tables scroll inside .scroll */
+  body{margin:0;height:100%;background:#0d1117;color:#e6edf3;font-family:Segoe UI,Tahoma,sans-serif;font-size:16px}
+  #content{zoom:0.9;width:111.111%;box-sizing:border-box}   /* zoom<1 shrinks a 100%-wide block below viewport width — widen by 1/zoom in CSS so it fills the window from the first paint (applyZoom keeps it in sync for A-/A+) */
+  a{color:#58a6ff}
+  .mono{font-family:Consolas,"Courier New",monospace}
+  .muted{color:#8b949e}
+  .err{color:#f85149}
+  .ok{color:#3fb950}
+  header{padding:8px 14px;background:#161b22;border-bottom:1px solid #30363d}
+  header h1{display:inline-block;font-size:15px;margin:0;font-weight:600;vertical-align:middle}
+  header h1 small{color:#8b949e;font-weight:400}
+  .pill{display:inline-block;font-size:11px;color:#8b949e;border:1px solid #30363d;border-radius:20px;padding:2px 10px;margin-left:8px;vertical-align:middle}
+  .pill.run{color:#ff8b3d;border-color:#bd561d}     /* orange: a run is in progress */
+  .pill.err{color:#ff8b8b;border-color:#b02020}     /* red: the run timed out / produced nothing */
+  .pill.ok{color:#7ee787;border-color:#2ea043}
+  .pill.bad{color:#ff8b3d;border-color:#bd561d}
+  .wrap{padding:12px 14px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin-bottom:12px}
+  .card h3{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e}
+  label.fld{display:block;margin:6px 0 2px;font-size:11px;color:#8b949e}
+  input.txt,select,textarea{background:#1c2330;border:1px solid #30363d;color:#e6edf3;border-radius:6px;padding:5px 8px;font-size:13px;font-family:Consolas,monospace}
+  input.wide{width:62%}
+  .btn{background:#1c2330;border:1px solid #30363d;color:#e6edf3;border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer;margin:2px}
+  .btn:hover{border-color:#58a6ff}
+  .btn.primary{background:#1f6feb;border-color:#1f6feb}
+  .btn.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  .row{white-space:nowrap}
+  .stat{display:inline-block;background:#1c2330;border:1px solid #30363d;border-radius:8px;padding:6px 12px;margin:0 6px 6px 0;min-width:70px;vertical-align:top}
+  .stat .n{font-size:17px;font-weight:700;display:block}
+  .stat .l{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
+  .cards3{width:100%}
+  .col3{display:inline-block;width:32%;vertical-align:top;margin-right:1%}
+  .brow{white-space:nowrap;margin:3px 0}
+  .blab{display:inline-block;width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;font-family:Consolas,monospace;font-size:11px}
+  .blab.lnk{cursor:pointer;color:#58a6ff}
+  .blab.lnk:hover{text-decoration:underline}
+  .btrack{display:inline-block;width:32%;height:12px;background:#1c2330;border-radius:3px;overflow:hidden;vertical-align:middle}
+  .bfill{display:block;height:100%;background:#1f6feb}
+  .bval{display:inline-block;width:18%;text-align:right;font-size:11px;color:#8b949e;vertical-align:middle}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:4px 7px;border-bottom:1px solid #30363d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  th{background:#1c2330;cursor:pointer;color:#c9d1d9;position:relative;z-index:3;box-shadow:0 1px 0 #30363d}
+  th:hover{color:#58a6ff}
+  .cgrip{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;z-index:6}
+  .cgrip:hover{background:#58a6ff;filter:alpha(opacity=45);opacity:.45}
+  td{max-width:360px}
+  tr.sus td{background:#2a1416}
+  tr.sus td.first{border-left:3px solid #ff6b6b}
+  tr.sel td{background:#1c2f4a}
+  .scroll{max-height:52vh;overflow:auto;border:1px solid #30363d;border-radius:8px;width:100%;box-sizing:border-box}
+  .tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:10px;font-weight:600;margin-right:3px}
+  .tag.sus{background:#3a1416;color:#ff6b6b}
+  .tag.usr{background:#3a2d10;color:#d29922}
+  .tag.lol{background:#10263f;color:#58a6ff}
+  .tag.rare{background:#241a3a;color:#b083f0}
+  .tag.ioc{background:#3a1416;color:#ff6b6b;border:1px solid #ff6b6b}
+  .tag.gen{background:#21262d;color:#8b949e}
+  .dl{font-family:Consolas,"Courier New",monospace;font-size:11px;max-height:210px;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px;margin:4px 0;white-space:nowrap;width:100%;box-sizing:border-box}
+  .dl div{overflow:hidden;text-overflow:ellipsis}
+  .hl-user{color:#d29922}
+  .hl-ioc{color:#ff6b6b;font-weight:700}
+  #log{white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;color:#8b949e;max-height:140px;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;display:none;margin-top:8px;width:100%;box-sizing:border-box}
+  .hide{display:none}
+  .lnk{cursor:pointer;color:#58a6ff}
+  .lnk:hover{text-decoration:underline}
+  .sep{display:inline-block;width:1px;height:18px;background:#30363d;margin:0 6px;vertical-align:middle}
+  .modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.66);z-index:1000;overflow:auto}
+  .modal .mcard{max-width:780px;margin:36px auto;background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 22px}
+  .modal h2{margin:0 0 6px;font-size:18px;font-weight:600}
+  .modal h3{margin:12px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e}
+  .modal ul{margin:4px 0;padding-left:20px}.modal li{margin:3px 0;font-size:13px}
+  .modal p{font-size:13px;margin:6px 0}
+  .modal code{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:2px 6px;font-family:Consolas,monospace;font-size:12px}
+  .modal .x{float:right;cursor:pointer;color:#8b949e;font-size:22px;line-height:1}.modal .x:hover{color:#e6edf3}
+  .modal .gh{font-family:Consolas,monospace;font-size:12px}
+  .maxwarn{display:inline-block;color:#e3b341;font-weight:600;cursor:help;border:1px solid #8a7a2a;background:#2a2410;border-radius:10px;padding:1px 8px;font-size:11px;margin-left:6px;vertical-align:middle}
+  .tag.reg{background:#132a1a;color:#7ee787}
+  .tag.off{background:#21262d;color:#6e7681}
+  .chip{display:inline-block;font-size:10px;padding:0 6px;border-radius:10px;border:1px solid #30363d;color:#8b949e;margin-left:4px;vertical-align:middle}
+  .chip.warn{border-color:#8a7a2a;color:#e3b341}
+  .chip.bad{border-color:#b02020;color:#ff8b8b}
+  .xml{font-family:Consolas,"Courier New",monospace;font-size:11px;white-space:pre;max-height:340px;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px;margin:4px 0;width:100%;box-sizing:border-box}
+  .warnbar{background:#2a2410;border:1px solid #8a7a2a;color:#e3b341;border-radius:6px;padding:6px 10px;font-size:12px;margin-bottom:8px}
+  .dsec{margin:8px 0 2px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e}
+</style>
+</head>
+<body>
+<header>
+  <h1>SchedTasks Analyzer <small>&mdash; scheduled-task persistence triage</small></h1>
+  <span class="pill" id="apppill" title="This app's version">app: checking&hellip;</span>
+  <span class="pill ok" id="enginepill" title="Task XML is parsed by this app itself (MSXML6) - no external parser is needed for the core triage">engine: built-in</span>
+  <span class="pill" id="verpill" title="RECmd.exe - used only for the optional TaskCache registry cross-check">RECmd: checking&hellip;</span>
+  <span class="pill" id="srcpill">no data loaded</span>
+  <span style="float:right">
+    <span class="pill" id="procTimer" title="Processing time. Starts when a run begins and stops when it finishes. The app is single-threaded, so the counter can pause during a heavy step (staging a large hive, parsing) and then jump forward - that is the step blocking, not a stall." style="min-width:150px;text-align:center;display:inline-block">Idle</span>
+    <button class="btn" id="instrBtn" onclick="openInstructions()" title="Download the latest HTML field guide from GitHub and open it in your browser">Instructions</button>
+    <button class="btn" id="helpBtn" onclick="openHelp()" title="Help, about &amp; GitHub link">Help</button>
+    <button class="btn primary hide" id="selfUpd" onclick="doSelfUpdate()" title="A newer version is available on GitHub">Update</button>
+    <button class="btn" id="fdown" title="Smaller text">A&minus;</button>
+    <button class="btn" id="fup" title="Larger text">A+</button>
+  </span>
+</header>
+
+<div class="wrap" id="content">
+
+  <!-- CONTROL PANEL -->
+  <div class="card">
+    <h3>Scheduled-task control panel</h3>
+    <div class="muted" id="exeline" style="font-size:11px;margin-bottom:6px"></div>
+    <label class="fld">Task data to process &mdash; a host or collection folder (every Windows\System32\Tasks below it is found), a Tasks folder, or one task file</label>
+    <input class="txt wide" id="pfPath" value="">
+    <input type="file" id="pfPick" style="display:none">
+    <button class="btn" id="browseBtn" title="Pick a host / collection folder or a Tasks folder">Folder&hellip;</button>
+    <button class="btn" id="browseFileBtn" title="Pick a single task XML file">File&hellip;</button>
+    <button class="btn" id="liveBtn" title="Point at this machine's own Tasks folder. Reading it needs an elevated (Run as administrator) mshta. The live SOFTWARE hive is locked by Windows, so the TaskCache cross-check is skipped for live runs.">This machine</button>
+    <label class="fld" title="Normally leave this blank: for every Tasks folder found, the app looks for ..\System32\config\SOFTWARE in the same collection and copies it (with its .LOG1/.LOG2) to %TEMP% for RECmd. Type a hive path here only to override that for a single-root run.">SOFTWARE hive for the TaskCache cross-check &mdash; found automatically beside each Tasks folder; type a path only to override it</label>
+    <input class="txt wide" id="hivePath" value="" placeholder="(automatic)">
+    <label class="muted" style="font-size:12px" title="Reads the SOFTWARE hive's TaskCache keys with RECmd: registered tasks with no XML, XML with no registration, deleted tasks recovered from the hive, hidden tasks with their SD removed, created / last-run times, and the registry copy of each task's actions."><input type="checkbox" id="optTc" checked> TaskCache cross-check (needs RECmd)</label>
+    <label class="fld" title="Required before processing. Guessed from the input path (Collection-&lt;host&gt;-... segments, a _Processed\&lt;host&gt;\ outDir, or this machine for live paths) - overwrite it if the guess is wrong.">Target hostname (required) &mdash; names the output folder _Processed\&lt;host&gt;\SchedTasks next to this app</label>
+    <input class="txt" id="hostName" value="" style="width:260px" placeholder="e.g. WORKSTATION-01">
+    <label class="fld">CSV output directory</label>
+    <input class="txt wide" id="outDir" value="">
+    <button class="btn" id="openDirBtn">Open folder</button>
+    <div style="margin-top:10px">
+      <button class="btn" id="verBtn" title="Locate RECmd and read its version">Check RECmd</button>
+      <button class="btn" id="updBtn" title="Download the RECmd folder (exe + Plugins + BatchExamples) next to this app">Download RECmd</button>
+      <span class="sep"></span>
+      <button class="btn primary" id="procBtn">Process &rarr; analyze</button>
+      <button class="btn" id="loadBtn">Load existing CSV&hellip;</button>
+      <input type="file" id="csvPick" style="display:none">
+      <span class="sep"></span>
+      <button class="btn" id="logToggle">Show log</button>
+      <span class="muted" id="status" style="margin-left:8px"></span>
+    </div>
+    <div style="margin-top:8px" id="producedRow" class="hide">
+      <label class="fld">Produced CSVs &mdash; pick one to view</label>
+      <select id="producedSel" style="min-width:70%"></select>
+      <button class="btn" id="loadSelBtn">Load selected</button>
+    </div>
+    <div id="log"></div>
+  </div>
+
+  <!-- RESULTS -->
+  <div id="results" class="hide">
+    <div class="card">
+      <h3 id="ovTitle">Overview</h3>
+      <div id="skewWarn" class="warnbar hide"></div>
+      <div id="statbar"></div>
+    </div>
+
+    <div class="card cards3 hide" id="pfCards">
+      <div class="col3"><h3>Run-as accounts</h3><div id="topExes"></div></div>
+      <div class="col3"><h3>Most recently changed</h3><div id="topNew"></div></div>
+      <div class="col3"><h3>Flagged tasks</h3><div id="topSus"></div></div>
+    </div>
+
+    <div class="card">
+      <h3 id="tableTitle">Records</h3>
+      <div class="row hide" style="margin-bottom:8px" id="viewToggle">
+        <button class="btn on" id="vTasks" title="One row per task, ranked by suspicion score (non-Microsoft first on ties)">Tasks</button>
+        <button class="btn" id="vTime" title="Same rows sorted by when the task was last changed (newest first)">Timeline (by Changed)</button>
+        <button class="btn" id="vFolders" title="Grouped per task folder: task count, enabled, flagged, max score, newest change. Click a folder to filter the Tasks view to it.">Folders</button>
+      </div>
+      <div class="row hide" style="margin-bottom:8px" id="pfCats">
+        <button class="btn on" data-cat="all">All</button>
+        <button class="btn" data-cat="sus">Flagged</button>
+        <button class="btn" data-cat="nonms">Non-Microsoft</button>
+        <button class="btn" data-cat="ioc">IOC hits</button>
+        <button class="btn" data-cat="exec">Exec</button>
+        <button class="btn" data-cat="com">COM handler</button>
+        <button class="btn" data-cat="hidden">Hidden</button>
+        <button class="btn" data-cat="disabled">Disabled</button>
+        <button class="btn" data-cat="reg" title="TaskCache findings: no SD (hidden task), registered without XML, Tree residue of a removed task, XML without registration, deleted task recovered from the hive, registry actions differ from the XML">Registry anomalies</button>
+      </div>
+      <div style="margin-bottom:8px;line-height:2.4">   <!-- wraps (unlike .row): the filter set is wider than a 1500px window -->
+        <input class="txt" id="q" placeholder="search all columns&hellip;" style="width:250px">
+        <span id="userWrap" class="hide"><span class="sep"></span><label class="muted" style="font-size:12px">run as:</label>
+          <select id="userSel" title="Filter every view to tasks that run as one account (the task principal: UserId, else GroupId; well-known SIDs shown by name). Registry-only rows have no principal and group as (unknown)."><option value="">All accounts</option></select></span>
+        <span id="tagWrap" class="hide"><span class="sep"></span><label class="muted" style="font-size:12px">tag:</label>
+          <select id="tagSel" title="Show only tasks carrying one tag"><option value="">any tag</option></select></span>
+        <span id="rootWrap" class="hide"><span class="sep"></span><label class="muted" style="font-size:12px">root:</label>
+          <select id="rootSel" style="max-width:360px" title="Filter by Tasks root (one per collection / Tasks folder processed)"><option value="">all roots</option></select></span>
+        <span id="srcWrap" class="hide"><span class="sep"></span><label class="muted" style="font-size:12px">source:</label>
+          <select id="srcSel" title="Filter by source file."><option value="">all source files</option></select></span>
+        <span id="folderChip" class="hide"></span>
+        <span id="pfDateCtl" class="hide">
+          <span class="sep"></span>
+          <input class="txt mono" id="dfrom" placeholder="from YYYY-MM-DD" style="width:140px" title="Filter by Changed (UTC)">
+          <span class="muted">&rarr;</span>
+          <input class="txt mono" id="dto" placeholder="to YYYY-MM-DD" style="width:140px" title="Filter by Changed (UTC)">
+        </span>
+        <span class="sep"></span>
+        <button class="btn" id="iocBtn">IOC / keywords&hellip;</button>
+        <button class="btn" id="clearBtn">clear</button>
+        <button class="btn" id="exportBtn">Export view &rarr; CSV</button>
+        <button class="btn" id="copyBtn">Copy for case notes</button>
+        <span class="muted" id="count" style="margin-left:8px"></span>
+      </div>
+      <div id="iocWrap" class="hide" style="margin-bottom:8px">
+        <label class="fld">IOC / keyword list &mdash; comma or newline separated; matched (case-insensitive substring) against the task path, author, description, run-as account and every action's command, arguments, working directory and COM class / data (XML and registry copies). Matches score +3 and light up red in the detail pane.</label>
+        <textarea id="iocBox" rows="3" style="width:70%;vertical-align:top"></textarea>
+        <button class="btn" id="iocApply">Apply</button>
+        <button class="btn" id="iocLoad">Load file&hellip;</button>
+        <input type="file" id="iocPick" style="display:none">
+        <span class="muted" id="iocInfo" style="font-size:11px"></span>
+      </div>
+      <div class="scroll" id="tblScroll"><table id="tbl"></table></div>
+      <div class="muted" id="pfFoot" style="font-size:11px;margin-top:6px">Changed (UTC) comes from the collection's own file metadata when present (vr), else the TaskCache Tree key (reg), else the extracted file time (file - can carry the unzip box's timezone error). Flagged rows are shaded (heuristic score &ge; 3 &mdash; see Help for the T1&ndash;T14 rules). Tasks under \Microsoft\ score half for LOLBin and user-path rules but are never exempt. Click a row for full detail; click a Run-as cell to filter to that account. Max 6000 rows shown; export writes the full filtered set.</div>
+    </div>
+
+    <div class="card hide" id="detailCard">
+      <h3>Task detail <span class="lnk" id="detCopy" style="float:right;margin-left:12px">copy record</span><span class="lnk" id="detClose" style="float:right">close &times;</span></h3>
+      <div id="detBody"></div>
+    </div>
+  </div>
+
+</div>
+
+<script language="JScript">
+"use strict";
+
+var APP_VERSION = "0.1.0";
+var KNOWN_LATEST_RECMD = "2.0.0.0";                                            // baseline 2026-10-03 (C:\ZimmermanTools copy)
+var RECMD_ZIP_URL = "https://download.ericzimmermanstools.com/RECmd.zip";      // official EZ mirror (folder-shaped: exe + Plugins + BatchExamples)
+var RECMD_PAGE = "https://ericzimmerman.github.io/";                           // for live latest-version lookup
+var EXE = "";                        // RECmd.exe - TaskCache cross-check only ("" = not found; XML triage still works)
+var EXE_DIR = "";
+var LOCAL_VER = "";
+var LATEST_VER = "";
+var WEB_OK = false;                  // could we reach the Zimmerman Tools site to check latest?
+var QUERY = "";
+var MAXROWS = 6000;
+/* Row-limit disclosure (family-wide wave): a capped table that merely says "(showing N)" reads
+   as complete to anyone who does not know the cap exists. One consistent amber chip wherever
+   the render cap bites, with the remedy in the tooltip. The cap keeps mshta responsive; the
+   DATA is intact - exports always write the FULL filtered set. */
+function maxRowsWarn(shown, total, extra){
+  if(!(total>shown)) return "";
+  return ' <span class="maxwarn" title="'+esc("Drawing the first "+nf(shown)+" of "+nf(total)+" matching rows - the render cap keeps the app responsive; it does NOT mean the rest were discarded. Narrow the view (search box, filters, case date window) to bring what you need inside the cap, or use Export view -> CSV: exports always write the FULL filtered set."+(extra?(" "+extra):""))+'">&#9888; Warning: Maximum Rows Exceeded</span>';
+}
+function copyCapNote(arr){ var total=(arr||[]).length;
+  return total>500 ? (" - first 500 of "+nf(total)+" (clipboard cap); Export view -> CSV writes the full set") : "";
+}
+var LASTOUTDIR = "";
+var qTimer = null;
+var MODE = "tasks";                  // "tasks" = rich scheduled-task analysis, "generic" = raw table
+var VIEW = "tasks";                  // tasks mode: "tasks" = score-ranked, "time" = by Changed, "folders" = grouped per task folder
+var ROWS = [];                       // one record per task (XML file, or registry-only TaskCache entry)
+var CURCAT = "all";
+var DFROM = 0, DTO = 0;
+var SORTKEY = 0, SORTDIR = 1;        // tasks view: default score desc (col 0 sorts by -score)
+var TSORTKEY = 0, TSORTDIR = -1;     // timeline view: default Changed desc
+var CSORTKEY = 4, CSORTDIR = -1;     // folders view: default flagged desc
+var IOCS = [];                       // lowercased IOC / keyword terms
+var DETREC = null;                   // record currently shown in the detail pane
+var GHEAD = null, GROWS = [], GSRC = "";
+var GSORTKEY = -1, GSORTDIR = 1;
+var GSRCIDX = -1;                    // generic mode: index of the SourceFile(name) column
+var SRCFILTER = "";                  // selected source-file filter (generic mode)
+var USERFILTER = "";                 // selected run-as account ("" = all) - exact RunAs display value (Native user dimension)
+var TAGFILTER = "", ROOTFILTER = "", FOLDERFILTER = "";
+var BUSY = false;                    // a run is in progress
+var PRODUCED = [];                   // CSVs produced by the last run
+var XMLTEXT = {};                    // lowercased SourceFile -> raw task XML (this session's runs only, 64 KB cap each)
+var RUN = null;                      // state of the run in progress
+
+/* suspicion knobs (spec section 7, T1-T14; flagged = score >= 3) */
+var SUS_MIN = 3;
+/* T2 launchers: script hosts and living-off-the-land binaries */
+var LOLBINS = {powershell:1,pwsh:1,cmd:1,mshta:1,wscript:1,cscript:1,rundll32:1,regsvr32:1,msiexec:1,certutil:1,
+  bitsadmin:1,wmic:1,msbuild:1,installutil:1,regasm:1,regsvcs:1,forfiles:1,curl:1,wsl:1,bash:1,conhost:1,hh:1,
+  cmstp:1,odbcconf:1,pcalua:1};
+/* T3 cradle / obfuscation in arguments (run on lowercased action text) */
+var CRADLE_RE = /(^|[\s"'])-e[a-z]*\s+[a-z0-9+\/=]{40,}|frombase64string|\biex\b|invoke-expression|downloadstring|downloadfile|downloaddata|invoke-webrequest|invoke-restmethod|\biwr\b|\birm\b|start-bitstransfer|net\.webclient|-urlcache|(^|\s)[\-\/]w(in|indowstyle)?\s+(h|hidden|1)(\s|$|")/;
+var B64_RE = /[A-Za-z0-9+\/]{200,}={0,2}/;
+/* T4 UNC share: \\host\... (not \\.\ or \\?\ device paths) */
+var UNC_RE = /(^|[\s"'=(,;])\\\\[a-z0-9][a-z0-9._$\-]*\\[^\s"']/;
+/* well-known principals -> display names */
+/* script errors: log them (in-app log + <appFolder>\SchedTasks-Analyzer.error.log) instead of IE's modal
+   error dialog, which would stall an unattended /auto run launched by the Artifact-Finder */
+window.onerror=function(msg,url,line){
+  try{ appendLog("SCRIPT ERROR line "+line+": "+msg); setStatus("Script error (line "+line+"): "+msg+" - see log","err"); }catch(e){}
+  try{ var d=htaFolder(); if(d){ var ef=new ActiveXObject("Scripting.FileSystemObject").OpenTextFile(d+"\\SchedTasks-Analyzer.error.log",8,true);
+    ef.WriteLine(new Date().toUTCString()+"  line "+line+": "+msg); ef.Close(); } }catch(e2){}
+  return true;
+};
+var WKSID = {"s-1-5-18":"SYSTEM","s-1-5-19":"LOCAL SERVICE","s-1-5-20":"NETWORK SERVICE","s-1-5-32-544":"Administrators",
+  "s-1-5-32-545":"Users","s-1-5-4":"INTERACTIVE","s-1-5-11":"Authenticated Users","s-1-1-0":"Everyone","s-1-5-6":"SERVICE"};
+/* ---------- tiny helpers ---------- */
+function $(id){ return document.getElementById(id); }
+function esc(s){ if(s==null) return ""; s=String(s);
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function endsWith(s,suf){ if(!s) return false; s=String(s); return s.length>=suf.length && s.substring(s.length-suf.length)===suf; }
+function contains(s,sub){ return String(s).indexOf(sub)>=0; }
+function nf(n){ n=String(n); var dot=n.indexOf("."); var dec=""; if(dot>=0){ dec=n.substring(dot); n=n.substring(0,dot); }
+  var r="",c=0; for(var k=n.length-1;k>=0;k--){ r=n.charAt(k)+r; c++; if(c%3===0&&k>0) r=","+r; } return r+dec; }
+function setStatus(msg,cls){ var el=$("status"); el.innerHTML=esc(msg); el.className=cls||"muted"; }
+function appendLog(t){ var el=$("log"); if(el.getAttribute("data-ph")==="1"){ el.innerHTML=""; el.setAttribute("data-ph","0"); }
+  el.style.display="block"; $("logToggle").innerHTML="Hide log"; el.innerHTML+=esc(t)+"\n"; el.scrollTop=el.scrollHeight; }
+function trimStr(s){ return String(s).replace(/^\s+|\s+$/g,""); }
+function baseName(p){ if(!p) return ""; p=String(p); var i=Math.max(p.lastIndexOf("\\"),p.lastIndexOf("/")); return i>=0?p.substring(i+1):p; }
+function showEl(id,vis){ var e=$(id); if(!e) return; var c=e.className.replace(/\s*\bhide\b/g,"");
+  e.className = vis ? c : (c+" hide"); }
+function msOf(s){ if(!s) return 0; var m=String(s).match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if(!m) return 0; return Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]); }
+function dayOf(s){ if(!s) return 0; var m=String(s).match(/(\d{4})-(\d{2})-(\d{2})/); if(!m) return 0; return Number(m[1]+m[2]+m[3]); }
+function clip(s,n){ s=String(s==null?"":s); return s.length>n?(s.substring(0,n)+"…"):s; }
+/* ---------- file IO via ActiveX (UTF-8 safe, with network-zone fallback) ----------
+   ADODB.Stream is the proper UTF-8 reader, but when the .hta runs from a NETWORK location
+   (mapped drive / UNC share) mshta assigns it the intranet/internet zone and ADODB refuses
+   every LoadFromFile/SaveToFile with "Safety settings on this computer prohibit accessing a
+   data source on another domain" — regardless of where the target file lives. Seen in the
+   field 2026-07-02 (app run from Z:\ on an analysis VM). FSO is not zone-checked, so we fall
+   back to ANSI file IO: CSV structure is unaffected (all-ASCII), only rare non-ASCII chars
+   (accented usernames in paths) display mojibake'd. Best fidelity = run locally. */
+var FILE_IO="adodb";                 // flips to "fso" permanently on the first zone-policy block
+function zoneNote(){
+  appendLog("NOTE: this app is running from a network location, so Windows zone policy blocks the UTF-8 file reader (ADODB.Stream). Falling back to ANSI file IO — everything works, but non-ASCII characters (accented usernames in paths) may display incorrectly. For full fidelity copy this folder to a LOCAL path (e.g. C:\\Tools\\SchedTasks-Analyzer) and run it from there.");
+}
+function readUtf8(path){
+  if(FILE_IO==="adodb"){
+    try{
+      // ReadText(-1) on a large file is quadratic in MSHTML (30s for 16MB); read in 64KB chunks (~0.1s).
+      var st=new ActiveXObject("ADODB.Stream");
+      st.Type=2; st.Charset="utf-8"; st.Open(); st.LoadFromFile(path);
+      var parts=[]; while(!st.EOS){ parts.push(st.ReadText(65536)); } st.Close();
+      return parts.join("");
+    }catch(e){
+      if(!/safety settings|data source/i.test(e.message||"")) throw e;   // real IO errors propagate
+      FILE_IO="fso"; zoneNote();
+    }
+  }
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var f=fso.OpenTextFile(path,1,false,0), out=f.ReadAll(); f.Close();
+  // a UTF-8 BOM read as ANSI shows up as three cp1252 chars — strip it
+  if(out.length>=3 && out.charCodeAt(0)===239 && out.charCodeAt(1)===187 && out.charCodeAt(2)===191) out=out.substring(3);
+  return out;
+}
+function writeUtf8(path,text){
+  if(FILE_IO==="adodb"){
+    try{
+      var st=new ActiveXObject("ADODB.Stream");
+      st.Type=2; st.Charset="utf-8"; st.Open(); st.WriteText(text); st.SaveToFile(path,2); st.Close();
+      return;
+    }catch(e){
+      if(!/safety settings|data source/i.test(e.message||"")) throw e;
+      FILE_IO="fso"; zoneNote();
+    }
+  }
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var f=fso.CreateTextFile(path,true,false); f.Write(text); f.Close();
+}
+function uid(){ return new Date().getTime()+""+Math.floor(Math.random()*100000); }
+/* cmd expands %N / %VAR% inside .bat lines even within quotes — Velociraptor trees contain literal % (C%3A) */
+function batEsc(s){ return String(s).replace(/%/g,"%%"); }
+
+/* Run a batch script, wait, return {rc, log}. show=true → visible console window. */
+function runBat(lines, show){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var sh=new ActiveXObject("WScript.Shell");
+  var tmp=fso.GetSpecialFolder(2)+"";
+  var stamp=uid();
+  var bat=tmp+"\\sta_"+stamp+".bat";
+  var logp=tmp+"\\sta_"+stamp+".log";
+  var f=fso.CreateTextFile(bat,true);
+  f.WriteLine("@echo off");
+  for(var i=0;i<lines.length;i++){ f.WriteLine(lines[i].replace(/__LOG__/g,logp)); }
+  f.Close();
+  var rc=sh.Run('cmd /c ""'+bat+'""', show?1:0, true);
+  var txt="";
+  try{ if(fso.FileExists(logp)) txt=readUtf8(logp); }catch(e){ txt="(could not read log: "+e.message+")"; }
+  try{ fso.DeleteFile(bat); }catch(e2){}
+  try{ if(fso.FileExists(logp)) fso.DeleteFile(logp); }catch(e3){}
+  return { rc:rc, log:txt };
+}
+
+/* ---------- processing-time pill (ported from vSphere Support Bundle Analyzer) ----------
+   A long parse used to read as a hang: the status line ticks, but nothing said how long the run had
+   taken or how long the previous one took. #procTimer lives in the header and holds three states -
+   Idle, an orange live counter while the tool runs, and a final green "Processing time mm:ss" (red
+   if the watchdog gave up waiting). The HTA is single-threaded, so the counter can freeze during a
+   blocking step and then jump; the pill tooltip says so rather than letting it look broken. */
+var PROC_T0=0, PROC_TIMER=null, PROC_WHAT="Processing";
+function procFmt(s){ var m=Math.floor(s/60), ss=s%60; return (m<10?"0":"")+m+":"+(ss<10?"0":"")+ss; }
+function procStart(what){
+  PROC_WHAT=what||"Processing";
+  PROC_T0=(new Date()).getTime();
+  if(PROC_TIMER) window.clearInterval(PROC_TIMER);
+  PROC_TIMER=window.setInterval(procTick,500);
+  var el=$("procTimer"); if(el){ el.className="pill run"; el.innerHTML=PROC_WHAT+" 00:00"; }
+}
+function procTick(){ if(!PROC_T0) return; var el=$("procTimer"); if(!el) return;
+  el.innerHTML=PROC_WHAT+" "+procFmt(Math.floor(((new Date()).getTime()-PROC_T0)/1000)); }
+function procStop(ok){
+  if(PROC_TIMER){ window.clearInterval(PROC_TIMER); PROC_TIMER=null; }
+  if(!PROC_T0) return;
+  var s=Math.floor(((new Date()).getTime()-PROC_T0)/1000), el=$("procTimer");
+  if(el){ el.className=(ok===false?"pill err":"pill ok"); el.innerHTML="Processing time "+procFmt(s); }
+  PROC_T0=0;
+}
+/* the run finished but produced nothing usable - recolour the stopped pill so the header agrees
+   with the error in the status line instead of showing a reassuring green time. */
+function procFail(){ var el=$("procTimer"); if(el && !PROC_T0) el.className="pill err"; }
+
+/* Run a batch NON-blocking; writes a .done marker when finished. Caller polls with pollDone().
+   This keeps the HTA script responsive (no MSHTML long-running-script watchdog). */
+function runBatAsync(lines, show){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var sh=new ActiveXObject("WScript.Shell");
+  var tmp=fso.GetSpecialFolder(2)+"";
+  var stamp=uid();
+  var bat=tmp+"\\sta_"+stamp+".bat";
+  var logp=tmp+"\\sta_"+stamp+".log";
+  var donep=tmp+"\\sta_"+stamp+".done";
+  var f=fso.CreateTextFile(bat,true);
+  f.WriteLine("@echo off");
+  for(var i=0;i<lines.length;i++){ f.WriteLine(lines[i].replace(/__LOG__/g,logp)); }
+  f.WriteLine('echo done> "'+donep+'"');   // marker written after everything above completes
+  f.Close();
+  sh.Run('cmd /c ""'+bat+'""', show?1:0, false);   // false = do NOT block the script
+  return { bat:bat, log:logp, done:donep, stamp:stamp, elapsed:0, graceSecs:10 };
+}
+function procAliveByTag(tag){
+  try{
+    var w=GetObject("winmgmts:\\\\.\\root\\cimv2");
+    var items=w.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE CommandLine LIKE '%sta_"+tag+"%'");
+    return items.Count>0;
+  }catch(e){ return true; }   // WMI unavailable → assume alive, so we never end a run early on error
+}
+function pollDone(ctx){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var grace=ctx.graceSecs||10;
+  var finished=fso.FileExists(ctx.done);
+  if(!finished && ctx.elapsed>=grace && ctx.stamp && !procAliveByTag(ctx.stamp)) finished=true;   // worker gone but .done sentinel lost -> still complete (recovers finished runs)
+  if(finished){
+    var log=""; try{ if(fso.FileExists(ctx.log)) log=readUtf8(ctx.log); }catch(e){ log="(could not read log: "+e.message+")"; }
+    try{ fso.DeleteFile(ctx.bat); }catch(e1){}
+    try{ fso.DeleteFile(ctx.done); }catch(e2){}
+    try{ if(fso.FileExists(ctx.log)) fso.DeleteFile(ctx.log); }catch(e3){}
+    if(ctx.procTimed) procStop(true);
+    ctx.onDone(log);
+    return;
+  }
+  ctx.elapsed+=1;
+  if(ctx.elapsed>1800){ if(ctx.procTimed) procStop(false); ctx.onTimeout&&ctx.onTimeout(); return; }   // 30-min safety cap
+  if(ctx.onTick) ctx.onTick(ctx.elapsed);
+  window.setTimeout(function(){ pollDone(ctx); }, 1000);
+}
+
+/* ---------- source-file filter (generic mode) ---------- */
+function distinctVals(arr){ var seen={}, out=[]; for(var i=0;i<arr.length;i++){ var v=arr[i]; if(v!=null && v!=="" && !seen[v]){ seen[v]=1; out.push(v); } } return out; }
+function shortPathN(p,n){ p=String(p); var parts=p.split("\\"); if(parts.length<=n) return p; return "…\\"+parts.slice(parts.length-n).join("\\"); }
+function shortPath(p){ return shortPathN(p,4); }
+function populateSourceFilter(vals){
+  var sel=$("srcSel"); sel.innerHTML="";
+  var o0=document.createElement("option"); o0.value=""; o0.text="all source files ("+vals.length+")"; sel.add(o0);
+  vals=vals.slice(0).sort();
+  for(var i=0;i<vals.length;i++){ var o=document.createElement("option"); o.value=vals[i]; o.text=shortPath(vals[i]); sel.add(o); }
+  SRCFILTER=""; sel.value="";
+  showEl("srcWrap", vals.length>1);
+}
+
+/* ---------- run-as filter (Native user dimension: the task principal) ----------
+   the filter key is the exact RunAs display value (UserId, else GroupId; well-known SIDs named).
+   Registry-only rows carry no principal and group as "(unknown)". Hidden when <= 1 distinct value. */
+function populateUserFilter(vals){
+  var sel=$("userSel"); if(!sel) return;
+  var prev=USERFILTER, found=false;
+  sel.innerHTML="";
+  var o0=document.createElement("option"); o0.value=""; o0.text="All accounts ("+vals.length+")"; sel.add(o0);
+  vals=vals.slice(0).sort();
+  for(var i=0;i<vals.length;i++){ var o=document.createElement("option"); o.value=vals[i]; o.text=vals[i]; sel.add(o);
+    if(vals[i]===prev) found=true; }
+  if(prev&&found){ sel.value=prev; } else { USERFILTER=""; sel.value=""; }
+  showEl("userWrap", vals.length>1);
+}
+/* tag / root dropdowns: value list -> options with counts; hidden when there is nothing to choose */
+function populateCountSel(selId, wrapId, counts, allLabel, labelFn, minShow){
+  var sel=$(selId); if(!sel) return;
+  var keys=[], k; for(k in counts){ if(counts.hasOwnProperty(k)) keys.push(k); }
+  keys.sort();
+  sel.innerHTML="";
+  var o0=document.createElement("option"); o0.value=""; o0.text=allLabel+" ("+keys.length+")"; sel.add(o0);
+  for(var i=0;i<keys.length;i++){ var o=document.createElement("option"); o.value=keys[i];
+    o.text=(labelFn?labelFn(keys[i]):keys[i])+"  ("+counts[keys[i]]+")"; sel.add(o); }
+  sel.value="";
+  showEl(wrapId, keys.length>=(minShow||1));
+}
+
+/* ---------- tooling: locate / version / download ---------- */
+function fileExists(p){ try{ return new ActiveXObject("Scripting.FileSystemObject").FileExists(p); }catch(e){ return false; } }
+function folderExists(p){ try{ return new ActiveXObject("Scripting.FileSystemObject").FolderExists(p); }catch(e){ return false; } }
+function parentDir(p){ var i=String(p).lastIndexOf("\\"); return i>=0?p.substring(0,i):p; }
+function htaFolder(){
+  try{ var cl=staHta.commandLine+""; var m=cl.match(/"([^"]+\.hta)"/i); if(!m) m=cl.match(/([A-Za-z]:\\[^"]+\.hta)/i);
+    if(m) return parentDir(m[1]); }catch(e){}
+  try{ var p=decodeURIComponent(location.pathname+"").replace(/^\//,"").replace(/\//g,"\\"); return parentDir(p); }catch(e2){}
+  return "";
+}
+/* ---------- RECmd (TaskCache cross-check only): locate / version / download ----------
+   The task XML is parsed by this app itself. RECmd reads the SOFTWARE hive's TaskCache keys
+   (registered tasks, hidden-task SD removal, created / last-run times, the registry copy of each
+   task's actions, deleted tasks recovered from hive slack). RECmd is FOLDER-shaped: the TaskCache
+   plugin is Plugins\RegistryPlugin.TaskCache.dll beside the exe. A missing RECmd never blocks the
+   XML triage - the run just skips the cross-check and says so. */
+var RECMD_PLUGIN=false;              // TaskCache plugin present beside the resolved exe (created / last-run times)
+function resolveExe(){
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var dir=htaFolder(), cands=[], i, firstBare="";
+  if(dir){ cands.push(dir+"\\RECmd\\RECmd.exe"); cands.push(dir+"\\RECmd.exe"); }   // toolkit copy (RECmd-Wrapper downloads to <toolkit>\RECmd\)
+  cands.push("C:\\ZimmermanTools\\RECmd\\RECmd.exe");
+  cands.push("C:\\ZimmermanTools\\net6\\RECmd\\RECmd.exe");
+  cands.push("C:\\Tools\\net9\\RECmd\\RECmd.exe");
+  for(i=0;i<cands.length;i++){ if(!fso.FileExists(cands[i])) continue;
+    if(fso.FileExists(parentDir(cands[i])+"\\Plugins\\RegistryPlugin.TaskCache.dll")){ EXE=cands[i]; EXE_DIR=parentDir(cands[i]); RECMD_PLUGIN=true; return true; }
+    if(!firstBare) firstBare=cands[i]; }
+  if(firstBare){ EXE=firstBare; EXE_DIR=parentDir(firstBare); RECMD_PLUGIN=false; return true; }   // usable: Tree + Actions still come from the batch output
+  EXE=""; EXE_DIR=dir||""; RECMD_PLUGIN=false; return false;
+}
+function verTuple(v){ var p=String(v).split("."); var a=[]; for(var i=0;i<p.length;i++) a.push(parseInt(p[i],10)||0); return a; }
+function verCmp(a,b){ a=verTuple(a); b=verTuple(b); var n=Math.max(a.length,b.length);
+  for(var i=0;i<n;i++){ var x=a[i]||0,y=b[i]||0; if(x!==y) return x<y?-1:1; } return 0; }
+function schemesComparable(a,b){ var am=parseInt(String(a).split(".")[0],10)||0, bm=parseInt(String(b).split(".")[0],10)||0;
+  return (am>=2000)===(bm>=2000); }   /* CalVer(site) vs SemVer(exe banner) are not comparable - avoids a perpetual bogus update nag */
+function fetchLatest(){
+  LATEST_VER=KNOWN_LATEST_RECMD; WEB_OK=false;
+  try{
+    var x=new ActiveXObject("MSXML2.ServerXMLHTTP.6.0");
+    x.setTimeouts(2000,3000,4000,4000);
+    x.open("GET", RECMD_PAGE, false); x.send();
+    if(x.status===200){ WEB_OK=true; var t=x.responseText+""; var m=t.match(/RECmd[\s\S]{0,800}?(\d+\.\d+\.\d+(?:\.\d+)?)/i); if(m) LATEST_VER=m[1]; }
+  }catch(e){ WEB_OK=false; }
+  return LATEST_VER;
+}
+function updateVerPill(){
+  var p=$("verpill"); if(!p) return;
+  if(!EXE){ p.className="pill"; p.innerHTML="RECmd: not found";
+    p.title="RECmd is only needed for the TaskCache cross-check. Use 'Download RECmd' to fetch it next to this app - the task XML triage works without it."; return; }
+  if(!LOCAL_VER){ p.className="pill bad"; p.innerHTML="RECmd: version unknown"; p.title=EXE; return; }
+  var outdated = WEB_OK && LATEST_VER && schemesComparable(LOCAL_VER,LATEST_VER) && verCmp(LOCAL_VER,LATEST_VER)<0;
+  p.className=outdated?"pill bad":"pill ok";
+  p.innerHTML="RECmd v"+esc(LOCAL_VER)+(outdated?(" &middot; update v"+esc(LATEST_VER)):"")+(RECMD_PLUGIN?"":" &middot; no TaskCache plugin");
+  p.title=EXE+(RECMD_PLUGIN?"":"\nPlugins\\RegistryPlugin.TaskCache.dll is missing beside this exe - created / last-run times will be blank (Tree, SD and actions still work).");
+}
+function evaluateTooling(){
+  var found=resolveExe();
+  if(found) $("exeline").innerHTML="Engine: built-in task XML parser (MSXML6) &middot; TaskCache cross-check via "+esc(EXE)+(RECMD_PLUGIN?"":" (no TaskCache plugin - times unavailable)");
+  else $("exeline").innerHTML='Engine: built-in task XML parser (MSXML6) &middot; <span class="err">RECmd not found</span> &mdash; the TaskCache cross-check is skipped until you use Download RECmd (task XML triage is unaffected)';
+  if(found) checkVersion(true); else LOCAL_VER="";
+  fetchLatest(); updateVerPill();
+}
+function downloadLatest(silent, done){   // silent: skip the confirms (unattended /auto); done(ok): fired after install
+  var base=htaFolder();
+  if(!base){ setStatus("Cannot determine the app folder to install into","err"); if(done) done(false); return; }
+  var target=base+"\\RECmd";   // the WHOLE RECmd folder (exe + Plugins + BatchExamples) lands next to the .hta - shared with RECmd-Wrapper
+  if(!silent && !confirm("Download RECmd from:\n"+RECMD_ZIP_URL+"\n\nInstall the whole RECmd folder (exe + Plugins) next to this app into:\n"+target+"\n\nProceed?")){ if(done) done(false); return; }
+  setStatus("Downloading & installing RECmd... (give it a moment)","muted");
+  var tq=String(target).replace(/'/g,"''");
+  var ps="$ErrorActionPreference='Stop';"
+    +"[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;"
+    +"$u='"+RECMD_ZIP_URL+"';"
+    +"$z=Join-Path $env:TEMP 'RECmd_dl.zip';"
+    +"$x=Join-Path $env:TEMP ('RECmd_x_'+[guid]::NewGuid().ToString('N'));"
+    +"Invoke-WebRequest -Uri $u -OutFile $z;"
+    +"Expand-Archive -Force -Path $z -DestinationPath $x;"
+    +"$exe=Get-ChildItem -Path $x -Recurse -Filter RECmd.exe | Select-Object -First 1;"
+    +"if(-not $exe){throw 'RECmd.exe not found in downloaded archive'};"
+    +"$src=Split-Path $exe.FullName;"
+    +"New-Item -ItemType Directory -Force -Path '"+tq+"' | Out-Null;"
+    +"Copy-Item -Path (Join-Path $src '*') -Destination '"+tq+"' -Recurse -Force;"
+    +"Remove-Item $z,$x -Recurse -Force -ErrorAction SilentlyContinue;"
+    +"Write-Output 'INSTALL_OK'";
+  try{
+    var r=runBat(['powershell -NoProfile -ExecutionPolicy Bypass -Command "'+ps+'" > "__LOG__" 2>&1']);
+    appendLog("--- RECmd download / install ---\n"+r.log);
+    if((r.log+"").indexOf("INSTALL_OK")>=0){ setStatus("RECmd installed to "+target,"ok"); evaluateTooling(); if(done) done(true); }
+    else { setStatus("RECmd download/install failed - see log","err"); if(done) done(false); }
+  }catch(e){ setStatus("RECmd download failed: "+e.message,"err"); if(done) done(false); }
+}
+/* /auto launch (the Finder's Process / Process-all): if the cross-check is on and RECmd is missing but
+   the web is reachable, fetch RECmd first so an unattended run still gets the registry view. Offline,
+   or on a failed download, the run goes ahead XML-only and says so. */
+function autoProcess(){
+  if(!$("optTc").checked || (EXE && fileExists(EXE)) || !WEB_OK){ processTasks(); return; }
+  setStatus("RECmd not present - downloading it before this auto run...","muted");
+  appendLog("/auto: RECmd missing - fetching it so the TaskCache cross-check can run");
+  downloadLatest(true, function(){ processTasks(); });
+}
+function checkVersion(quiet){
+  if(!EXE || !fileExists(EXE)){ LOCAL_VER=""; updateVerPill(); if(!quiet) setStatus("RECmd.exe not found - use 'Download RECmd' (only the TaskCache cross-check needs it)","err"); return; }
+  try{
+    // VERIFIED 2026-10-03: RECmd 2.0.0.0 --version prints just "2.0.0.0" (a bare no-arg run can crash on Console.WindowWidth)
+    var r=runBat(["set DOTNET_ROLL_FORWARD=Major", '"'+EXE+'" --version > "__LOG__" 2>&1']);
+    var m=r.log.match(/(\d+\.\d+\.\d+(?:\.\d+)?)/);
+    if(m){ LOCAL_VER=m[1]; updateVerPill(); if(!quiet) setStatus("RECmd v"+LOCAL_VER+" detected"+(RECMD_PLUGIN?"":" (no TaskCache plugin beside it)"),"ok"); }
+    else { LOCAL_VER=""; updateVerPill(); if(!quiet){ setStatus("Ran RECmd but could not parse its version - see log","err"); appendLog(r.log); } }
+  }catch(e){ LOCAL_VER=""; updateVerPill(); if(!quiet) setStatus("Version check failed: "+e.message,"err"); }
+}
+
+/* can we actually enumerate this folder? (permission sanity-check before staging it) */
+function canListFolder(p){
+  try{ var fso=new ActiveXObject("Scripting.FileSystemObject");
+    var e=new Enumerator(fso.GetFolder(p).Files); e.atEnd(); return true; }catch(err){ return false; }
+}
+
+/* ---------- target hostname + _Processed output convention (family, 2026-07-06) ----------
+   All processed output lands in <appFolder>\_Processed\<Hostname>\<AppName>\ so the
+   Artifact-Finder (and the operator) can see per-host state at a glance. The hostname field is
+   REQUIRED before processing (not for just viewing CSVs). Guess order: Collection-<host>-<date>
+   segment in the input path → \_Processed\<host>\ in a CLI-passed outDir → live-machine paths
+   (X:\Windows / X:\Users → this computer's name). User-typed values are never overwritten. */
+var APP_NAME="SchedTasks";
+var HOST_TOUCHED=false, OUT_TOUCHED=false;
+function sanitHost(s){ return String(s).replace(/[^A-Za-z0-9._\-]/g,"-").replace(/^[\-.]+|[\-.]+$/g,""); }
+function guessHost(p){
+  p=String(p||"");
+  var m=p.match(/Collection-([A-Za-z0-9][A-Za-z0-9\-_\.]*?)-\d{4}-\d{2}-\d{2}/i); if(m) return m[1];
+  m=p.match(/[\\\/]_Processed[\\\/]([^\\\/]+)[\\\/]/i); if(m) return m[1];
+  if(/^[a-z]:\\(windows|users)(\\|$)/i.test(p)){ try{ return new ActiveXObject("WScript.Network").ComputerName+""; }catch(e){} }
+  return "";
+}
+function defaultOutDir(){
+  var h=sanitHost($("hostName").value); if(!h) return "";
+  var base=htaFolder(); if(!base){ try{ base=new ActiveXObject("Scripting.FileSystemObject").GetSpecialFolder(2)+""; }catch(e){ return ""; } }
+  return base+"\\_Processed\\"+h+"\\"+APP_NAME;
+}
+function syncOutDir(){ if(OUT_TOUCHED) return; var d=defaultOutDir(); if(d) $("outDir").value=d; }
+function hostGuessFrom(p){
+  if(!HOST_TOUCHED || !trimStr($("hostName").value)){ var g=guessHost(p); if(g) $("hostName").value=sanitHost(g); }
+  syncOutDir();
+}
+function requireHost(){
+  var h=sanitHost($("hostName").value);
+  if(!h){ setStatus("Target hostname is required — it names the output folder _Processed\\<host>\\"+APP_NAME+". Type the host this artifact came from, then process again.","err");
+    try{ $("hostName").focus(); }catch(e){} return ""; }
+  if(!trimStr($("outDir").value)) syncOutDir();
+  return h;
+}
+
+/* ---------- shared toolkit IOC list (family, 2026-07-06) ----------
+   IOC.txt next to the .hta (the toolkit folder — same file for every wrapper + the
+   Artifact-Finder): one term per line, # comments. Auto-merged into the IOC box at launch
+   (before any /auto run) so one paste covers the whole engagement; terms already present
+   are not duplicated, and the operator's box stays editable as usual. */
+function loadToolkitIoc(){
+  try{
+    var base=htaFolder(); if(!base) return;
+    var p=base+"\\IOC.txt";
+    if(!fileExists(p)) return;
+    var parts=String(readUtf8(p)).split(/\r?\n/), add=[], i;
+    for(i=0;i<parts.length;i++){ var s=trimStr(parts[i]); if(s && s.charAt(0)!=="#") add.push(s); }
+    if(!add.length) return;
+    var cur=$("iocBox").value, curL={}, cp=String(cur).split(/[\r\n,;]+/);
+    for(i=0;i<cp.length;i++){ var c=trimStr(cp[i]).toLowerCase(); if(c) curL[c]=1; }
+    var fresh2=[]; for(i=0;i<add.length;i++){ if(!curL[add[i].toLowerCase()]) fresh2.push(add[i]); }
+    if(!fresh2.length) return;
+    $("iocBox").value=(trimStr(cur)?(cur.replace(/\s+$/,"")+"\r\n"):"")+fresh2.join("\r\n");
+    applyIocs();
+    appendLog("Toolkit IOC list: merged "+fresh2.length+" term(s) from "+p);
+    setStatus("Loaded "+fresh2.length+" IOC term(s) from the toolkit IOC.txt","ok");
+  }catch(e){}
+}
+
+/* ---------- run provenance (family, 2026-07-06) ----------
+   Appended into <outDir>\runinfo.json after every successful run. The Artifact-Finder reads
+   these to bind outputs to their exact source artifact (and host) even without its manifest —
+   standalone wrapper runs show up as processed too. */
+function writeRunInfo(outdir, input, freshFiles){
+  try{
+    var p=String(outdir).replace(/[\\\/]+$/,"")+"\\runinfo.json";
+    var arr=[];
+    try{ if(fileExists(p)){ var old=JSON.parse(readUtf8(p)); if(old && old.length!=null) arr=old; } }catch(e0){}
+    var d=new Date(); function p2(x){ return (x<10?"0":"")+x; }
+    var iso=d.getUTCFullYear()+"-"+p2(d.getUTCMonth()+1)+"-"+p2(d.getUTCDate())+"T"+p2(d.getUTCHours())+":"+p2(d.getUTCMinutes())+":"+p2(d.getUTCSeconds())+"Z";  // real UTC (was local, mislabeled) — QA item 7
+    var names=[]; for(var i=0;i<freshFiles.length && i<50;i++) names.push(freshFiles[i].name||String(freshFiles[i]));
+    var ent={app:APP_NAME, appVersion:APP_VERSION, host:sanitHost($("hostName").value),
+              input:String(input||""), finishedUtc:iso, files:names};
+    if(CASE_FROM) ent.winFrom=CASE_FROM; if(CASE_TO) ent.winTo=CASE_TO;   // case window recorded (Finder-observable), never scored
+    arr.push(ent);
+    writeUtf8(p, JSON.stringify(arr,null,2));
+    RUNINFO_LAST={path:p, iso:iso};
+  }catch(e){}
+}
+var RUNINFO_LAST=null;   // the entry writeRunInfo just appended — patched with a triage summary after the auto-load
+function patchRunInfoSummary(summary){
+  /* second-phase runinfo write (family, 2026-07-07): the scored rows only exist after the
+     auto-load that follows a run, so the headline triage numbers are patched onto the entry
+     writeRunInfo appended moments earlier. The Artifact-Finder renders these in its
+     per-host triage summary. Best-effort — a missing summary just shows as counts-only. */
+  try{
+    if(!RUNINFO_LAST || !summary) return;
+    var arr=JSON.parse(readUtf8(RUNINFO_LAST.path));
+    if(!arr || arr.length==null) return;
+    for(var i=arr.length-1;i>=0;i--){ var e=arr[i];
+      if(e && e.app===APP_NAME && e.finishedUtc===RUNINFO_LAST.iso){ e.summary=summary; break; } }
+    writeUtf8(RUNINFO_LAST.path, JSON.stringify(arr,null,2));
+  }catch(e){}
+}
+function buildRunSummary(){
+  /* headline triage numbers from the scored rows: entries, wrapper-flagged count, max score,
+     top-3 "name (score)" — here name = the task path.
+     "Flagged" uses this app's own suspicion threshold (rec.sus). */
+  try{
+    if(!ROWS.length) return null;
+    var flagged=0, maxScore=0, top=[], i;
+    for(i=0;i<ROWS.length;i++){ var r=ROWS[i];
+      if(r.score>maxScore) maxScore=r.score;
+      if(r.sus) flagged++; }
+    var sorted=ROWS.slice(0);
+    sorted.sort(function(a,b){ return b.score-a.score; });
+    for(i=0;i<sorted.length && top.length<3;i++){ if(sorted[i].score>0) top.push(sorted[i].name+" ("+sorted[i].score+")"); }
+    return {entries:ROWS.length, flagged:flagged, maxScore:maxScore, top:top};
+  }catch(e){ return null; }
+}
+
+/* =============================== ENGINE ===============================
+   discover Tasks roots -> robocopy-stage each root (long-path / %-name safe; evidence is never opened
+   in place) + its SOFTWARE hive -> RECmd TaskCache sweep (optional) -> parse task XML (MSXML6) in small
+   batches -> join XML + TaskCache + Velociraptor file metadata -> write ONE CSV -> ingest that CSV
+   (a fresh run and "Load existing CSV" share one code path). */
+var CSVCOLS=["TaskPath","Enabled","Hidden","Author","RunAs","LogonType","RunLevel","ActionCount","ActionType",
+  "Command","Arguments","WorkingDir","ComClassId","ComData","AllActions","ActionCommands","TriggerCount",
+  "TriggerTypes","TriggerSummary","StartBoundary","EndBoundary","MinRepetition","DeleteExpired","RegDate",
+  "ChangedUtc","ChangedSource","FileCreatedUtc","FileModifiedUtc","FileTimeSource","ExtractedModifiedUtc",
+  "FileSize","RegStatus","RegGuid","RegCreatedUtc","RegLastStartUtc","RegLastStopUtc","RegLastResult",
+  "RegTaskState","TreeLastWriteUtc","TreeIndex","TreeSD","RegActions","RegActionCommands","Description",
+  "Source","Uri","XmlVersion","SecurityDescriptor","ParseStatus","TasksRoot","SourceFile"];
+var TC_REB=[
+  "Description: SchedTasks-Analyzer TaskCache sweep",
+  "Author: SchedTasks-Analyzer",
+  "Version: 1",
+  "Id: 6b1d2f0e-6a0c-4c55-9b8e-1f3a5d7c9e21",
+  "Keys:",
+  "    -",
+  "        Description: TaskCache Tasks",
+  "        HiveType: Software",
+  "        Category: TaskCache",
+  "        KeyPath: Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks",
+  "        Recursive: false",
+  "        Comment: \"TaskCache plugin - created / last start / last stop / result per task GUID\"",
+  "    -",
+  "        Description: TaskCache Tree",
+  "        HiveType: Software",
+  "        Category: TaskCacheTree",
+  "        KeyPath: Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree",
+  "        Recursive: true",
+  "        Comment: \"Tree Id / Index / SD per task path\"",
+  "    -",
+  "        Description: TaskCache Actions",
+  "        HiveType: Software",
+  "        Category: TaskCacheActions",
+  "        KeyPath: Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\\*",
+  "        ValueName: Actions",
+  "        IncludeBinary: true",
+  "        Recursive: false",
+  "        Comment: \"registry copy of each task's actions\""
+].join("\r\n")+"\r\n";
+
+function utcStamp(){ var d=new Date(); function p(x){ return (x<10?"0":"")+x; }
+  return d.getUTCFullYear()+p(d.getUTCMonth()+1)+p(d.getUTCDate())+p(d.getUTCHours())+p(d.getUTCMinutes())+p(d.getUTCSeconds()); }
+function dateUtcStr(d){ try{ d=new Date(d); if(isNaN(d.getTime())) return ""; }catch(e){ return ""; }
+  function p(x){ return (x<10?"0":"")+x; }
+  return d.getUTCFullYear()+"-"+p(d.getUTCMonth()+1)+"-"+p(d.getUTCDate())+" "+p(d.getUTCHours())+":"+p(d.getUTCMinutes())+":"+p(d.getUTCSeconds()); }
+function normTs(s){ var m=String(s||"").match(/(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/); return m?(m[1]+" "+m[2]):""; }
+function flat(s){ return trimStr(String(s==null?"":s).replace(/\s*[\r\n]+\s*/g," ")); }
+function normTaskPath(p){ var s=trimStr(String(p||"").replace(/\//g,"\\")).toLowerCase();
+  if(s.charAt(0)!=="\\") s="\\"+s; s=s.replace(/\\+$/,""); return s||"\\"; }
+function rootKind(pL){
+  if(/\\windows\\(system32|sysnative)\\tasks$/.test(pL)) return "sys32";
+  if(/\\windows\\syswow64\\tasks$/.test(pL)) return "wow64";
+  if(/\\windows\\tasks$/.test(pL)) return "legacy";
+  return "";
+}
+function windowsDirOf(p){ var m=String(p).match(/^(.*\\windows)\\(system32|sysnative|syswow64|tasks)(\\|$)/i); return m?m[1]:""; }
+function collectionDirOf(p){ var i=String(p).toLowerCase().indexOf("\\uploads\\"); return i>0?String(p).substring(0,i):""; }
+function hiveFor(rootPath){ var w=windowsDirOf(rootPath); if(!w) return ""; var h=w+"\\System32\\config\\SOFTWARE"; return fileExists(h)?h:""; }
+function isLiveSystemPath(p){ try{ var w=String(new ActiveXObject("WScript.Shell").ExpandEnvironmentStrings("%WINDIR%")).toLowerCase();
+  return String(p).toLowerCase().indexOf(w+"\\")===0; }catch(e){ return false; } }
+function isVrTree(p){ return /%3a/i.test(String(p)) || String(p).toLowerCase().indexOf("\\uploads\\")>=0; }
+function decodeRel(rel, vr){ if(!vr || String(rel).indexOf("%")<0) return rel;
+  try{ return decodeURIComponent(rel); }catch(e){ return String(rel).replace(/%([0-9A-Fa-f]{2})/g,function(a,h){ return String.fromCharCode(parseInt(h,16)); }); } }
+function wellKnown(v){ v=trimStr(v); if(!v) return "";
+  var l=v.toLowerCase(); if(WKSID[l]) return WKSID[l];
+  if(/^(nt authority\\)?(system|localsystem)$/.test(l)) return "SYSTEM";
+  if(/^(nt authority\\)?local ?service$/.test(l)) return "LOCAL SERVICE";
+  if(/^(nt authority\\)?network ?service$/.test(l)) return "NETWORK SERVICE";
+  return v; }
+function isoDurSecs(s){ var m=String(s||"").match(/^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i);
+  if(!m) return 0; return (+(m[1]||0))*86400+(+(m[2]||0))*3600+(+(m[3]||0))*60+Math.floor(+(m[4]||0)); }
+
+/* ---------- MSXML helpers: namespace-agnostic XPath via local-name() ---------- */
+var XP={};
+function lx(path){ if(XP[path]) return XP[path]; var segs=path.split("/"), out=[];
+  for(var i=0;i<segs.length;i++) out.push(segs[i]==="*"?"*":("*[local-name()='"+segs[i]+"']"));
+  return (XP[path]=out.join("/")); }
+function xs(ctx,path){ try{ return ctx.selectSingleNode(lx(path)); }catch(e){ return null; } }
+function xl(ctx,path){ var out=[]; try{ var nl=ctx.selectNodes(lx(path)); for(var i=0;i<nl.length;i++) out.push(nl[i]); }catch(e){} return out; }
+function xt(ctx,path){ var n=xs(ctx,path); return n?flat(n.text):""; }
+function nodeName(n){ try{ return String(n.baseName||n.nodeName).replace(/^.*:/,""); }catch(e){ return ""; } }
+function newDom(){
+  var d=null;
+  try{ d=new ActiveXObject("MSXML2.DOMDocument.6.0"); }catch(e){ try{ d=new ActiveXObject("MSXML2.DOMDocument.3.0"); }catch(e2){ return null; } }
+  d.async=false; d.validateOnParse=false; d.resolveExternals=false;
+  try{ d.setProperty("ProhibitDTD",true); }catch(e3){}            // evidence is attacker-authored: no DTDs, no external entities
+  try{ d.setProperty("SelectionLanguage","XPath"); }catch(e4){}
+  return d;
+}
+
+/* ---------- run orchestration ---------- */
+function runFail(msg){
+  BUSY=false; $("procBtn").disabled=false; procStop(false);
+  setStatus(msg,"err"); appendLog("RUN FAILED: "+msg);
+  if(RUN) cleanupStage(RUN.stage);
+}
+function cleanupStage(dir){
+  if(!dir) return;
+  try{ var fso=new ActiveXObject("Scripting.FileSystemObject"); if(fso.FolderExists(dir)) fso.DeleteFolder(dir,true); }
+  catch(e){ try{ runBat(['rmdir /s /q "'+batEsc(dir)+'" > "__LOG__" 2>&1']); }catch(e2){} }
+}
+function processTasks(){
+  if(BUSY){ setStatus("A run is already in progress - wait for it to finish.","err"); return; }
+  var inp=trimStr($("pfPath").value).replace(/[\\\/]+$/,"");
+  if(!inp){ setStatus("Set the input: a host / collection folder, a Tasks folder, or a task file","err"); return; }
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  var isDir=fso.FolderExists(inp), isFile=!isDir && fso.FileExists(inp);
+  if(!isDir && !isFile){ setStatus("Input not found: "+inp,"err"); return; }
+  if(isFile && /\.csv$/i.test(inp)){ loadCsvFile(inp); return; }
+  if(!requireHost()) return;
+  var outdir=trimStr($("outDir").value).replace(/[\\\/]+$/,"");
+  if(!outdir){ setStatus("Set an output directory","err"); return; }
+  if(isDir && !canListFolder(inp)){ setStatus("Access denied reading "+inp+" - a live Tasks folder needs an elevated (Run as administrator) run; point at a collected copy instead.","err"); return; }
+  BUSY=true; $("procBtn").disabled=true; procStart("Processing");
+  var tmp=fso.GetSpecialFolder(2)+"";
+  RUN={inp:inp, outdir:outdir, stamp:utcStamp(), stage:tmp+"\\sta_stage_"+uid(), roots:[], files:[], rows:[], warn:[], pi:0};
+  appendLog("=== SchedTasks run "+RUN.stamp+"Z - input "+inp);
+  if(isFile){ RUN.roots=[{path:parentDir(inp), kind:"file", file:baseName(inp)}]; stageRoots(); return; }
+  var kind=rootKind(inp.toLowerCase());
+  if(kind){ RUN.roots=[{path:inp, kind:kind}]; stageRoots(); return; }
+  // walk down for Tasks roots: directories only, dir /s /b (long-path safe), UTF-16 via cmd /u
+  setStatus("Looking for Windows\\System32\\Tasks folders below the input...","muted");
+  var lst=tmp+"\\sta_dirs_"+uid()+".lst";
+  var ctx=runBatAsync(['cmd /u /c dir "'+batEsc(inp)+'" /s /b /a:d > "'+batEsc(lst)+'" 2>> "__LOG__"'], false);
+  ctx.onDone=function(){
+    var roots=[];
+    try{ var ts=fso.OpenTextFile(lst,1,false,-1);
+      while(!ts.AtEndOfStream){ var p=""; try{ p=ts.ReadLine(); }catch(er){ continue; }
+        if(!p) continue; var k=rootKind(p.toLowerCase()); if(k) roots.push({path:p, kind:k}); }
+      ts.Close(); }catch(e){ appendLog("Directory listing could not be read: "+e.message); }
+    try{ fso.DeleteFile(lst); }catch(e2){}
+    if(!roots.length){
+      appendLog("No Windows\\System32\\Tasks folder below the input - treating the input folder itself as a folder of task files (top level only).");
+      roots.push({path:inp, kind:"flat"}); }
+    roots.sort(function(a,b){ var x=a.path.toLowerCase(), y=b.path.toLowerCase(); return x<y?-1:(x>y?1:0); });
+    RUN.roots=roots; stageRoots();
+  };
+  ctx.onTimeout=function(){ runFail("The directory listing did not finish within 30 minutes."); };
+  window.setTimeout(function(){ pollDone(ctx); },500);
+}
+function stageRoots(){
+  var R=RUN, fso=new ActiveXObject("Scripting.FileSystemObject");
+  var useTc=$("optTc").checked, manualHive=trimStr($("hivePath").value);
+  if(useTc && !(EXE && fileExists(EXE))){ useTc=false; R.warn.push("RECmd not found - TaskCache cross-check skipped (use Download RECmd to enable it)."); }
+  try{ fso.CreateFolder(R.stage); }catch(e){}
+  var tcBase=R.outdir+"\\TaskCache", anyHive=false, i, hiveOwner={};
+  var robo=' /COPY:DAT /R:0 /W:0 /NFL /NDL /NJH /NJS /NP > nul 2>&1';
+  var lines=["set DOTNET_ROLL_FORWARD=Major",
+    'if not exist "'+batEsc(R.outdir)+'" mkdir "'+batEsc(R.outdir)+'"',
+    "echo SchedTasks-Analyzer: staging "+R.roots.length+" Tasks root(s) to a temp folder",
+    "echo This window closes automatically when finished.", "echo."];
+  for(i=0;i<R.roots.length;i++){ var r=R.roots[i], n=i+1;
+    r.n=n; r.stageDir=R.stage+"\\r"+n; r.vr=isVrTree(r.path);
+    if(r.kind==="file") lines.push('robocopy "'+batEsc(r.path)+'" "'+batEsc(r.stageDir)+'" "'+batEsc(r.file)+'"'+robo);
+    else lines.push('robocopy "'+batEsc(r.path)+'" "'+batEsc(r.stageDir)+'"'+(r.kind==="flat"?"":" /E /DCOPY:T")+robo);
+    lines.push('>> "__LOG__" echo ROBO '+n+' %ERRORLEVEL%');           // redirect FIRST: "echo x 1>>" would be read as a handle redirect
+    r.hive=""; r.hiveNote="";
+    if(!useTc) continue;
+    var hv=(manualHive && R.roots.length===1)?manualHive:hiveFor(r.path);
+    if(hv && isLiveSystemPath(hv)){ r.hiveNote="the live SOFTWARE hive is locked by Windows - cross-check skipped"; hv=""; }
+    if(hv && !fileExists(hv)){ r.hiveNote="hive not found: "+hv; hv=""; }
+    if(!hv){ if(!r.hiveNote) r.hiveNote="no SOFTWARE hive found beside this Tasks folder"; continue; }
+    // System32\Tasks + SysWOW64\Tasks (+ Windows\Tasks) of one collection share ONE hive: sweep it once, join all to it
+    var hk=hv.toLowerCase();
+    if(hiveOwner[hk]){ r.hive=hv; r.shareWith=hiveOwner[hk]; r.hiveNote="shares the hive of root "+hiveOwner[hk].n; continue; }
+    hiveOwner[hk]=r;
+    r.hive=hv; anyHive=true;
+    // RECmd writes into the SHORT temp stage: its plugin CSV lands two folders deep (<stamp>\<stamp>_TaskCache__SOFTWARE.csv)
+    // and a deep outDir pushed that past MAX_PATH, where RECmd fails silently. The raw CSVs are copied to <outDir>\TaskCache afterwards.
+    r.hiveStage=R.stage+"\\h"+n; r.tcDir=R.stage+"\\tc"+n; r.tcKeep=tcBase;
+    var hb=baseName(hv);
+    lines.push("echo RECmd TaskCache sweep - root "+n+" of "+R.roots.length+" ...");
+    lines.push('robocopy "'+batEsc(parentDir(hv))+'" "'+batEsc(r.hiveStage)+'" "'+batEsc(hb)+'" "'+batEsc(hb)+'.LOG1" "'+batEsc(hb)+'.LOG2"'+robo);
+    lines.push('>> "__LOG__" echo HIVE '+n+' %ERRORLEVEL%');
+    var rc='"'+batEsc(EXE)+'" -f "'+batEsc(r.hiveStage+"\\"+hb)+'" --bn "'+batEsc(R.stage+"\\SchedTasks_TaskCache.reb")+'" --csv "'+batEsc(r.tcDir)+'"';
+    lines.push(rc+' >> "__LOG__" 2>&1');
+    // dirty hive with no usable transaction logs -> RECmd aborts with no CSV: retry once without log replay
+    lines.push('if not exist "'+batEsc(r.tcDir)+'\\*_RECmd_Batch_*.csv" ( >> "__LOG__" echo NLRETRY '+n+' & '+rc+' --nl >> "__LOG__" 2>&1 )');
+  }
+  if(anyHive){ try{ var f=fso.CreateTextFile(R.stage+"\\SchedTasks_TaskCache.reb",true,false); f.Write(TC_REB); f.Close(); }
+    catch(e3){ appendLog("Could not write the RECmd batch file: "+e3.message); } }
+  appendLog("Staging "+R.roots.length+" root(s) to "+R.stage+(anyHive?" + RECmd TaskCache sweep ("+EXE+")":""));
+  for(i=0;i<R.roots.length;i++) appendLog("  root "+R.roots[i].n+": "+R.roots[i].path+(R.roots[i].hive?("  [hive "+R.roots[i].hive+"]"):(R.roots[i].hiveNote?("  ["+R.roots[i].hiveNote+"]"):"")));
+  var ctx=runBatAsync(lines, true);
+  ctx.onTick=function(s){ setStatus("Staging"+(anyHive?" + RECmd TaskCache sweep":"")+"... "+s+"s elapsed (app responsive; results load when done)","muted"); };
+  ctx.onTimeout=function(){ runFail("Staging / RECmd did not finish within 30 minutes - check the console window."); };
+  ctx.onDone=function(log){ R.stageLog=log||""; afterStage(); };
+  window.setTimeout(function(){ pollDone(ctx); },1000);
+}
+function logCode(log, tag, n){ var m=String(log).match(new RegExp("(^|\\n)"+tag+" "+n+" (-?\\d+)")); return m?parseInt(m[2],10):-1; }
+function afterStage(){
+  var R=RUN, log=R.stageLog, fso=new ActiveXObject("Scripting.FileSystemObject"), i;
+  appendLog("--- staging / RECmd output ---\n"+log);
+  for(i=0;i<R.roots.length;i++){ var r=R.roots[i];
+    r.robo=logCode(log,"ROBO",r.n);
+    if(r.robo>=8) R.warn.push("robocopy could not copy all of root "+r.n+" (exit "+r.robo+")"+(isLiveSystemPath(r.path)?" - a live Tasks folder needs an elevated run":"")+": "+r.path);
+    if(r.hive && !r.shareWith){ var hc=logCode(log,"HIVE",r.n);
+      if(hc>=8 || hc<0){ R.warn.push("Could not copy the SOFTWARE hive for root "+r.n+" (exit "+hc+") - cross-check skipped for it."); r.hive=""; }
+      if(log.indexOf("NLRETRY "+r.n)>=0){ r.tcNl=true; R.warn.push("Root "+r.n+": dirty hive with no usable transaction logs - RECmd re-ran without log replay (recent registry changes may be missing)."); } }
+    r.files=[]; walkStage(fso, r.stageDir, "", r, r.files, 0);
+    for(var j=0;j<r.files.length;j++) R.files.push(r.files[j]);
+  }
+  if(!R.files.length){
+    // an EMPTY Tasks folder with a populated TaskCache is exactly the wiped-XML case the cross-check exists for:
+    // carry on to the registry join whenever any root's RECmd sweep left a batch CSV
+    var tcOk=false;
+    for(i=0;i<R.roots.length;i++){ var rr=R.roots[i]; if(rr.hive && !rr.shareWith && rr.tcDir && newestFile(rr.tcDir, /_RECmd_Batch_.*\.csv$/i, false)) tcOk=true; }
+    if(!tcOk){
+      runFail("No task files were staged from the input"+(R.warn.length?(" - "+R.warn.join(" ")):" - check that the folder holds a Windows\\System32\\Tasks tree or task XML files."));
+      return; }
+    R.warn.push("No task XML files were staged - showing the TaskCache registry view only.");
+  }
+  R.pi=0;
+  setStatus("Parsing "+nf(R.files.length)+" task file(s)...","muted");
+  window.setTimeout(parseBatch, 10);
+}
+function walkStage(fso, dir, rel, root, out, depth){
+  if(depth>30 || out.length>50000) return;
+  var f; try{ f=fso.GetFolder(dir); }catch(e){ return; }
+  try{ var fe=new Enumerator(f.Files);
+    for(; !fe.atEnd(); fe.moveNext()){ var fl=fe.item(), nm=fl.Name+"";
+      if(/\.idx$/i.test(nm)) continue;                                   // Velociraptor sparse-index sidecars
+      if(root.kind==="legacy" && !/\.job$/i.test(nm)) continue;           // Windows\Tasks: only legacy .job files matter
+      var md="", cd=""; try{ md=dateUtcStr(fl.DateLastModified); }catch(e1){} try{ cd=dateUtcStr(fl.DateCreated); }catch(e2){}
+      out.push({stagePath:fl.Path+"", rel:rel+"\\"+nm, size:fl.Size-0, mod:md, cre:cd, root:root}); } }catch(e3){}
+  try{ var se=new Enumerator(f.SubFolders);
+    for(; !se.atEnd(); se.moveNext()){ var sf=se.item(); walkStage(fso, sf.Path+"", rel+"\\"+sf.Name, root, out, depth+1); } }catch(e4){}
+}
+function parseBatch(){
+  var R=RUN, end=Math.min(R.pi+40, R.files.length);
+  for(; R.pi<end; R.pi++){ var f=R.files[R.pi];
+    try{ R.rows.push(parseTaskFile(f)); }
+    catch(e){ var b=blankRow(f); b.ParseStatus="unreadable"; R.rows.push(b); appendLog("Unreadable: "+f.rel+" - "+e.message); } }
+  setStatus("Parsing task files... "+nf(R.pi)+" / "+nf(R.files.length),"muted");
+  if(R.pi<R.files.length){ window.setTimeout(parseBatch, 1); return; }
+  window.setTimeout(joinAndWrite, 10);
+}
+
+/* ---------- one task file -> one CSV row ---------- */
+function blankRow(f){
+  var r={}, i; for(i=0;i<CSVCOLS.length;i++) r[CSVCOLS[i]]="";
+  var root=f.root, rel=decodeRel(f.rel, root.vr);
+  r._root=root; r._relDec=rel;
+  r.TasksRoot=root.path;
+  r.SourceFile=(root.kind==="file")?(root.path+"\\"+root.file):(root.path+f.rel);
+  r.TaskPath=rel;                                     // file location IS the task path for real Tasks roots; flat/file roots use <URI> below
+  r.FileSize=String(f.size);
+  r.FileModifiedUtc=f.mod; r.FileCreatedUtc=f.cre; r.ExtractedModifiedUtc=f.mod;
+  r.FileTimeSource=f.mod?(root.vr?"file-extracted":"file"):"";
+  return r;
+}
+function readTaskText(p){
+  var fso=new ActiveXObject("Scripting.FileSystemObject"), head="";
+  var f=fso.OpenTextFile(p,1,false,0); try{ head=f.Read(2); }catch(e){} f.Close();
+  if(!head) return {text:"", enc:"empty"};
+  var c0=head.charCodeAt(0), c1=head.length>1?head.charCodeAt(1):-1, u, t;
+  if(c0===255 && c1===254){ u=fso.OpenTextFile(p,1,false,-1); try{ t=u.ReadAll(); }catch(e2){ t=""; } u.Close(); return {text:t, enc:"utf16"}; }
+  if(c1===0){ u=fso.OpenTextFile(p,1,false,-1); try{ t=u.ReadAll(); }catch(e3){ t=""; } u.Close(); return {text:t, enc:"utf16-nobom"}; }
+  return {text:readUtf8(p), enc:(c0===239?"utf8-bom":"utf8")};
+}
+function xmlEnt(s){ return String(s).replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&amp;/g,"&"); }
+function regexSalvage(r, t){   // malformed XML: still surface what it would have run so scoring sees it
+  function g(tag){ var m=String(t).match(new RegExp("<(?:\\w+:)?"+tag+"[^>]*>([^<]*)<","i")); return m?flat(xmlEnt(m[1])):""; }
+  r.Command=g("Command"); r.Arguments=g("Arguments"); r.WorkingDir=g("WorkingDirectory"); r.Author=g("Author");
+  r.RunAs=wellKnown(g("UserId")||g("GroupId")); r.Uri=g("URI"); r.ComClassId=g("ClassId");
+  if(r.Command){ r.ActionType="Exec"; r.ActionCount="1"; r.ActionCommands=r.Command; r.AllActions=fmtAction({t:"Exec",cmd:r.Command,args:r.Arguments,wd:r.WorkingDir}); }
+}
+function fmtAction(a){
+  if(a.t==="Exec") return "Exec: "+a.cmd+(a.args?(" "+a.args):"")+(a.wd?(" [in "+a.wd+"]"):"");
+  if(a.t==="ComHandler") return "Com: "+a.clsid+(a.data?(" "+a.data):"");
+  return a.t+(a.text?(": "+a.text):"");
+}
+function hhmm(sb){ var m=String(sb).match(/T(\d{2}:\d{2})/); return m?m[1]:"?"; }
+function triggerSummary(tr){
+  var nm=nodeName(tr), s;
+  if(nm==="BootTrigger") s="Boot";
+  else if(nm==="LogonTrigger"){ var u=xt(tr,"UserId"); s="Logon("+(u?wellKnown(u):"any user")+")"; }
+  else if(nm==="IdleTrigger") s="Idle";
+  else if(nm==="RegistrationTrigger") s="Registration";
+  else if(nm==="TimeTrigger"){ var sb=xt(tr,"StartBoundary"), eb=xt(tr,"EndBoundary"); s="Once@"+(sb||"?")+(eb?(" -> "+eb):""); }
+  else if(nm==="CalendarTrigger"){ var at=hhmm(xt(tr,"StartBoundary"));
+    if(xs(tr,"ScheduleByDay")){ var di=xt(tr,"ScheduleByDay/DaysInterval"); s=((di && di!=="1")?("Every "+di+"d"):"Daily")+"@"+at; }
+    else if(xs(tr,"ScheduleByWeek")){ var dws=xl(tr,"ScheduleByWeek/DaysOfWeek/*"), dn=[], k; for(k=0;k<dws.length;k++) dn.push(nodeName(dws[k]).substring(0,3)); s="Weekly("+dn.join(",")+")@"+at; }
+    else if(xs(tr,"ScheduleByMonth")) s="Monthly@"+at;
+    else if(xs(tr,"ScheduleByMonthDayOfWeek")) s="Monthly(by weekday)@"+at;
+    else s="Calendar@"+at; }
+  else if(nm==="EventTrigger"){ var sub=xt(tr,"Subscription"), m=sub.match(/Path=["']([^"']+)["']/i); s="Event("+(m?m[1]:"?")+")"; }
+  else if(nm==="SessionStateChangeTrigger") s="SessionState("+(xt(tr,"StateChange")||"?")+")";
+  else if(nm==="WnfStateChangeTrigger") s="Wnf";
+  else s=nm.replace(/Trigger$/,"");
+  var rep=xt(tr,"Repetition/Interval"); if(rep) s+=" /rep "+rep;
+  if(xt(tr,"Enabled")==="false") s+=" [off]";
+  return s;
+}
+function parseTaskFile(f){
+  var r=blankRow(f), i;
+  if(/\.job$/i.test(f.rel)){ r.ParseStatus="job"; return r; }
+  if(f.size>2097152){ r.ParseStatus="oversize"; return r; }
+  var rd=readTaskText(f.stagePath), t=String(rd.text||"");
+  if(t.charCodeAt(0)===0xFEFF) t=t.substring(1);
+  if(!trimStr(t)){ r.ParseStatus="empty"; return r; }
+  if(trimStr(t).charAt(0)!=="<"){ r.ParseStatus="not-task"; return r; }   // not XML at all: something stashed in a Tasks folder
+  XMLTEXT[String(r.SourceFile).toLowerCase()]=(t.length>65536)?(t.substring(0,65536)+"\n... (truncated at 64 KB)"):t;
+  var d=newDom(); if(!d){ r.ParseStatus="no-msxml"; return r; }
+  var ok=false; try{ ok=d.loadXML(t.replace(/^\s*<\?xml[^>]*\?>/,"")); }catch(e){ ok=false; }
+  if(!ok || !d.documentElement){ r.ParseStatus="malformed"; regexSalvage(r,t); return r; }
+  var root=d.documentElement;
+  if(nodeName(root).toLowerCase()!=="task"){ r.ParseStatus="not-task"; return r; }
+  r.ParseStatus=(rd.enc==="utf16")?"ok":"not-utf16";
+  r.XmlVersion=root.getAttribute("version")||"";
+  r.Author=xt(root,"RegistrationInfo/Author"); r.Description=xt(root,"RegistrationInfo/Description");
+  r.Uri=xt(root,"RegistrationInfo/URI"); r.RegDate=xt(root,"RegistrationInfo/Date");
+  r.Source=xt(root,"RegistrationInfo/Source"); r.SecurityDescriptor=xt(root,"RegistrationInfo/SecurityDescriptor");
+  if((f.root.kind==="flat" || f.root.kind==="file") && r.Uri) r.TaskPath=(r.Uri.charAt(0)==="\\"?"":"\\")+r.Uri;
+  // principal: the one Actions/@Context names, else the first
+  var actEl=xs(root,"Actions"), ctxId=actEl?(actEl.getAttribute("Context")||""):"";
+  var prs=xl(root,"Principals/Principal"), pr=null;
+  for(i=0;i<prs.length;i++){ if(ctxId && prs[i].getAttribute("id")===ctxId){ pr=prs[i]; break; } }
+  if(!pr && prs.length) pr=prs[0];
+  if(pr){ r.RunAs=wellKnown(xt(pr,"UserId")||xt(pr,"GroupId")); r.LogonType=xt(pr,"LogonType"); r.RunLevel=xt(pr,"RunLevel"); }
+  r.Enabled=(xt(root,"Settings/Enabled")==="false")?"false":"true";
+  r.Hidden=(xt(root,"Settings/Hidden")==="true")?"true":"false";
+  r.DeleteExpired=xt(root,"Settings/DeleteExpiredTaskAfter");
+  // triggers
+  var trs=xl(root,"Triggers/*"), types=[], seen={}, sums=[], minRep=0, minRepS="", early="", earlyEnd="";
+  for(i=0;i<trs.length;i++){ var tr=trs[i], tn=nodeName(tr);
+    if(!seen[tn]){ seen[tn]=1; types.push(tn); }
+    sums.push(triggerSummary(tr));
+    var rep=xt(tr,"Repetition/Interval"), rs=isoDurSecs(rep);
+    if(rs>0 && (!minRep || rs<minRep)){ minRep=rs; minRepS=rep; }
+    var sb=xt(tr,"StartBoundary"); if(sb && (!early || sb<early)){ early=sb; earlyEnd=xt(tr,"EndBoundary"); } }
+  r.TriggerCount=String(trs.length); r.TriggerTypes=types.join(";"); r.TriggerSummary=sums.join("; ");
+  r.StartBoundary=early; r.EndBoundary=earlyEnd; r.MinRepetition=minRepS;
+  // actions - every one of them (scoring evaluates all)
+  var acts=actEl?xl(actEl,"*"):[], list=[], cmds=[];
+  for(i=0;i<acts.length;i++){ var a=acts[i], an=nodeName(a), o;
+    if(an==="Exec") o={t:"Exec", cmd:xt(a,"Command"), args:xt(a,"Arguments"), wd:xt(a,"WorkingDirectory")};
+    else if(an==="ComHandler") o={t:"ComHandler", clsid:xt(a,"ClassId"), data:xt(a,"Data")};
+    else o={t:an, text:flat(a.text).substring(0,300)};
+    list.push(fmtAction(o)); if(o.t==="Exec") cmds.push(o.cmd);
+    if(i===0){ r.ActionType=o.t;
+      if(o.t==="Exec"){ r.Command=o.cmd; r.Arguments=o.args; r.WorkingDir=o.wd; }
+      else if(o.t==="ComHandler"){ r.ComClassId=o.clsid; r.ComData=o.data; } } }
+  r.ActionCount=String(acts.length); r.AllActions=list.join(" || "); r.ActionCommands=cmds.join(" | ");
+  return r;
+}
+
+/* ---------- TaskCache Actions blob (registry copy of a task's actions) ----------
+   VERIFIED 2026-10-03 on Server 2016 (v2) and Win10 (v3) hives - layout in the header comment. */
+var ACT_MAGIC={26214:"Exec",30583:"ComHandler",34952:"SendEmail",39321:"ShowMessage"};   // 0x6666 0x7777 0x8888 0x9999
+function hexToBytes(h){ var p=String(h||"").split("-"), b=[], i, v; if(p.length<4) return null;
+  for(i=0;i<p.length;i++){ v=parseInt(p[i],16); if(isNaN(v)) return null; b.push(v); } return b; }
+function rdU16(b,o){ return b[o]|(b[o+1]<<8); }
+function rdU32(b,o){ return (b[o]|(b[o+1]<<8)|(b[o+2]<<16))+b[o+3]*16777216; }
+function rdStr(b,o,len){ var s=[], i, c; for(i=0;i+1<len;i+=2){ c=b[o+i]|(b[o+i+1]<<8); if(c) s.push(String.fromCharCode(c)); } return s.join(""); }
+function hx(v,w){ var s=v.toString(16).toUpperCase(); while(s.length<w) s="0"+s; return s; }
+function rdGuid(b,o){ return "{"+hx(rdU32(b,o),8)+"-"+hx(rdU16(b,o+4),4)+"-"+hx(rdU16(b,o+6),4)+"-"+hx(b[o+8],2)+hx(b[o+9],2)+"-"
+  +hx(b[o+10],2)+hx(b[o+11],2)+hx(b[o+12],2)+hx(b[o+13],2)+hx(b[o+14],2)+hx(b[o+15],2)+"}"; }
+function decodeActions(hex){
+  var b=hexToBytes(hex); if(!b || b.length<8) return null;
+  var o=2, out={ver:rdU16(b,0), ctx:"", acts:[], ok:true}, guard=0;
+  function str(){ if(o+4>b.length) throw new Error("eof"); var l=rdU32(b,o); o+=4; if(l>131072 || o+l>b.length) throw new Error("len"); var s=rdStr(b,o,l); o+=l; return s; }
+  try{
+    out.ctx=str();
+    while(o+2<=b.length && guard++<400){
+      var mg=rdU16(b,o);
+      if(!ACT_MAGIC[mg]){ o+=2; continue; }               // v3 Exec carries a 2-byte trailer - step over anything that is not a magic
+      o+=2; str();                                         // action id (normally empty)
+      if(mg===26214){ var c=str(), a=str(), w=str(); out.acts.push({t:"Exec", cmd:c, args:a, wd:w}); }
+      else if(mg===30583){ if(o+16>b.length) break; var g=rdGuid(b,o); o+=16; out.acts.push({t:"ComHandler", clsid:g, data:str()}); }
+      else { out.acts.push({t:ACT_MAGIC[mg], text:"(not decoded)"}); break; }   // SendEmail / ShowMessage: deprecated, rare
+    }
+  }catch(e){ out.ok=false; }
+  return out;
+}
+
+/* ---------- Velociraptor collection metadata: true UTC file times ---------- */
+function loadVrMeta(root){
+  var coll=collectionDirOf(root.path); if(!coll) return null;
+  var resDir=coll+"\\results"; if(!folderExists(resDir)) return null;
+  var fso=new ActiveXObject("Scripting.FileSystemObject"), files=[], map={}, n=0, i, j;
+  try{ var fe=new Enumerator(fso.GetFolder(resDir).Files);
+    for(; !fe.atEnd(); fe.moveNext()){ var nm=fe.item().Name+""; if(/metadata\.json$/i.test(nm)) files.push(fe.item().Path+""); } }catch(e){ return null; }
+  for(i=0;i<files.length;i++){
+    var lines; try{ lines=String(readUtf8(files[i])).split("\n"); }catch(e1){ continue; }
+    for(j=0;j<lines.length;j++){ var ln=lines[j]; if(ln.indexOf("Tasks")<0) continue;
+      var o; try{ o=JSON.parse(ln); }catch(e2){ continue; }
+      var sf=String(o.SourceFile||o.OSPath||o.FullPath||""), k=sf.toLowerCase(), wi=k.indexOf("\\windows\\");
+      if(wi<0) continue;
+      var m=normTs(o.Modified||o.Mtime||o.LastModified), c=normTs(o.Created||o.Btime);
+      if(m||c){ map[k.substring(wi)]={m:m, c:c}; n++; } } }
+  if(!n) return null;
+  appendLog("Root "+root.n+": collection file metadata - "+n+" task file time(s) from "+files.join(", "));
+  return map;
+}
+function metaKey(row){ var root=row._root, pl=String(root.path).toLowerCase(), wi=pl.indexOf("\\windows\\");
+  if(wi<0 || root.kind==="file" || root.kind==="flat") return "";
+  return (pl.substring(wi)+row._relDec).toLowerCase(); }
+
+/* ---------- TaskCache (RECmd output) ---------- */
+function newestFile(dir, re, recurse){
+  var fso=new ActiveXObject("Scripting.FileSystemObject"), best=null;
+  function walk(d, depth){ var f; try{ f=fso.GetFolder(d); }catch(e){ return; }
+    try{ var fe=new Enumerator(f.Files); for(; !fe.atEnd(); fe.moveNext()){ var it=fe.item(), nm=it.Name+"";
+      if(re.test(nm) && (!best || nm>best.name)) best={name:nm, path:it.Path+""}; } }catch(e1){}
+    if(recurse && depth<3){ try{ var se=new Enumerator(f.SubFolders); for(; !se.atEnd(); se.moveNext()) walk(se.item().Path+"", depth+1); }catch(e2){} } }
+  walk(dir,0); return best;
+}
+/* provenance: keep RECmd's raw output beside the analyzer CSV, flattened to short names */
+function keepRawTc(root, bf, pf){
+  try{ var fso=new ActiveXObject("Scripting.FileSystemObject"), d=root.tcKeep;
+    if(!fso.FolderExists(d)) fso.CreateFolder(d);
+    var pre=d+"\\"+RUN.stamp+"_r"+root.n;
+    fso.CopyFile(bf.path, pre+"_RECmd_TaskCache_batch.csv", true);
+    if(pf) fso.CopyFile(pf.path, pre+"_RECmd_TaskCache_plugin.csv", true);
+  }catch(e){ RUN.warn.push("Could not keep the raw RECmd CSVs for root "+root.n+" in "+root.tcKeep+": "+e.message); }
+}
+function headIdx(head){ var idx={}; for(var h=0;h<head.length;h++) idx[trimStr(head[h])]=h; return idx; }
+function loadTaskCache(root){
+  if(!root.hive || !root.tcDir || !folderExists(root.tcDir)) return null;
+  var bf=newestFile(root.tcDir, /_RECmd_Batch_.*\.csv$/i, false), pf=newestFile(root.tcDir, /_TaskCache_.*\.csv$/i, true);
+  if(!bf){ RUN.warn.push("Root "+root.n+": RECmd produced no CSV - cross-check skipped (see log)."); return null; }
+  keepRawTc(root, bf, pf);
+  var tc={all:[], byKey:{}, byGuid:{}, plugin:!!pf, nl:!!root.tcNl}, raw, idx, r, i;
+  // path = normalized join key, disp = original case for display. Only "<path>" (live) and "<path>|del" keys
+  // are ever joined to XML; a registration whose GUID conflicts with the one already holding that path gets a
+  // "<path>|{GUID}" key, so it stays its own record instead of overwriting the live task's data.
+  function entry(path, del, disp, guidKey){ var k=path+(guidKey?("|"+guidKey):(del?"|del":"")), e=tc.byKey[k];
+    if(!e){ e={path:path, disp:disp||path, del:!!del, guid:"", index:"", sd:false, hasId:false}; tc.byKey[k]=e; tc.all.push(e); } return e; }
+  raw=parseCSV(readUtf8(bf.path)); idx=headIdx(raw[0]||[]);
+  var iCat=idx.Category, iKp=idx.KeyPath, iVn=idx.ValueName, iVd=idx.ValueData, iDel=idx.Deleted, iLw=idx.LastWriteTimestamp;
+  var treePre="\\taskcache\\tree", acts={};
+  for(i=1;i<raw.length;i++){ r=raw[i]; if(r.length<6) continue;
+    var cat=cell(r,iCat), kp=cell(r,iKp), kpl=kp.toLowerCase(), vn=cell(r,iVn), vd=cell(r,iVd), del=(cell(r,iDel)==="True"), lw=normTs(cell(r,iLw));
+    if(cat==="TaskCacheTree"){ var tp=kpl.indexOf(treePre); if(tp<0) continue;
+      var tpo=kp.substring(tp+treePre.length), e=entry(normTaskPath(tpo), del, (tpo.charAt(0)==="\\"?"":"\\")+tpo);
+      if(lw) e.treeLw=lw;
+      if(vn==="Id"){ e.guid=String(vd).toUpperCase(); e.hasId=true; } else if(vn==="Index") e.index=vd; else if(vn==="SD") e.sd=true; }
+    else if(cat==="TaskCacheActions"){ var gm=kp.match(/\{[0-9A-Fa-f\-]+\}\s*$/); if(gm) acts[gm[0].toUpperCase()]={hex:vd, del:del, lw:lw}; } }
+  // Tree keys without an Id value are folders, not tasks
+  var leaves=[]; for(i=0;i<tc.all.length;i++){ if(tc.all[i].hasId) leaves.push(tc.all[i]); else delete tc.byKey[tc.all[i].path+(tc.all[i].del?"|del":"")]; }
+  tc.all=leaves;
+  for(i=0;i<tc.all.length;i++){ var le=tc.all[i]; if(le.guid && (!tc.byGuid[le.guid] || tc.byGuid[le.guid].del)) tc.byGuid[le.guid]=le; }
+  if(pf){ raw=parseCSV(readUtf8(pf.path)); idx=headIdx(raw[0]||[]);
+    for(i=1;i<raw.length;i++){ r=raw[i]; if(r.length<6) continue;
+      var g=String(cell(r,idx.KeyName)).toUpperCase(), po=trimStr(cell(r,idx.Path));
+      if(!po) po="(TaskCache "+g+")";                              // keys recovered from hive slack can lose their Path value
+      var p=normTaskPath(po);
+      // GUID first. Fall back to the path only when that entry has no GUID yet or the SAME GUID - a different GUID
+      // at the same path (e.g. a deleted registration recovered from hive slack) is a separate task.
+      var pe=tc.byGuid[g], pk=tc.byKey[p];
+      if(!pe && pk && (!pk.guid || pk.guid===g)) pe=pk;
+      if(!pe){ pe=pk?entry(p,false,po,g):entry(p,false,po); pe.hasId=false; }
+      if(po && pe.disp===pe.path) pe.disp=po;                      // prefer the plugin's original-case path
+      if(!pe.guid) pe.guid=g; tc.byGuid[g]=pe; pe.inTasks=true;
+      pe.created=normTs(cell(r,idx.CreatedOn)); pe.lastStart=normTs(cell(r,idx.LastStart)); pe.lastStop=normTs(cell(r,idx.LastStop));
+      pe.state=cell(r,idx.TaskState); pe.result=cell(r,idx.LastActionResult);
+      pe.author=cell(r,idx.Author); pe.desc=cell(r,idx.Description); pe.source=cell(r,idx.Source); } }
+  for(var ag in acts){ if(!acts.hasOwnProperty(ag)) continue;
+    var ae=tc.byGuid[ag]; if(!ae){ ae=entry("(taskcache "+ag.toLowerCase()+")", acts[ag].del, "(TaskCache "+ag+")", ag); ae.guid=ag; tc.byGuid[ag]=ae; }
+    ae.inTasks=true; if(acts[ag].del) ae.tasksDel=true;
+    var dec=decodeActions(acts[ag].hex);
+    if(dec){ var al=[], cl=[], k2; for(k2=0;k2<dec.acts.length;k2++){ al.push(fmtAction(dec.acts[k2])); if(dec.acts[k2].t==="Exec") cl.push(dec.acts[k2].cmd); }
+      ae.acts=dec.acts; ae.regActions=al.join(" || ")+(dec.ok?"":" (partially decoded)"); ae.regCmds=cl.join(" | "); } }
+  appendLog("Root "+root.n+": TaskCache - "+tc.all.length+" Tree task entries, "+(pf?"plugin times present":"NO plugin output (times blank)")+(tc.nl?", processed without log replay":""));
+  return tc;
+}
+function resultHex(v){ var n=parseInt(v,10); if(isNaN(n)) return String(v||""); if(n<0) n+=4294967296; return "0x"+hx(n,8); }
+function fillReg(row, e){
+  row.RegGuid=e.guid||""; row.RegCreatedUtc=e.created||""; row.RegLastStartUtc=e.lastStart||""; row.RegLastStopUtc=e.lastStop||"";
+  row.RegLastResult=(e.result!=null && e.result!=="")?resultHex(e.result):""; row.RegTaskState=e.state||"";
+  row.TreeLastWriteUtc=e.treeLw||""; row.TreeIndex=e.index||""; row.TreeSD=e.hasId?(e.sd?"yes":"no"):"";
+  row.RegActions=e.regActions||""; row.RegActionCommands=e.regCmds||"";
+}
+function regOnlyRow(root, e){
+  var r={}, i; for(i=0;i<CSVCOLS.length;i++) r[CSVCOLS[i]]="";
+  r._root=root; r._relDec="";
+  r.TaskPath=(e.disp.charAt(0)==="\\" || e.disp.charAt(0)==="(")?e.disp:("\\"+e.disp);
+  r.TasksRoot=root.path; r.SourceFile=root.hive+" [TaskCache"+(e.guid?(" "+e.guid):"")+"]";
+  r.ParseStatus="no-xml";
+  r.RegStatus=(e.del||e.tasksDel)?"deleted":(e.inTasks?"reg-only":"tree-only");
+  fillReg(r,e);
+  r.Author=e.author||""; r.Description=e.desc||""; r.Source=e.source||"";
+  if(e.acts && e.acts.length){ var a0=e.acts[0];
+    r.ActionCount=String(e.acts.length); r.ActionType=a0.t; r.AllActions=r.RegActions; r.ActionCommands=r.RegActionCommands;
+    if(a0.t==="Exec"){ r.Command=a0.cmd; r.Arguments=a0.args; r.WorkingDir=a0.wd; } else if(a0.t==="ComHandler"){ r.ComClassId=a0.clsid; r.ComData=a0.data; } }
+  return r;
+}
+function joinAndWrite(){
+  var R=RUN, i, j, r, row;
+  try{
+    for(i=0;i<R.roots.length;i++){ r=R.roots[i]; r.meta=loadVrMeta(r); r.tc=r.shareWith?null:loadTaskCache(r); }
+    for(i=0;i<R.roots.length;i++){ r=R.roots[i]; if(r.shareWith) r.tc=r.shareWith.tc; }
+    var extra=[];
+    for(i=0;i<R.rows.length;i++){ row=R.rows[i]; r=row._root;
+      if(r.meta){ var mk=metaKey(row), mt=mk?r.meta[mk]:null;
+        if(mt){ row.FileModifiedUtc=mt.m||row.FileModifiedUtc; row.FileCreatedUtc=mt.c||row.FileCreatedUtc; row.FileTimeSource="vr-metadata"; } }
+      // join on the TaskPath only: for real Tasks roots that is the file's LOCATION (what the scheduler loads); <URI>
+      // is attacker-writable and must not let one file claim another task's registration. (Flat / single-file
+      // inputs already use <URI> as their TaskPath, so nothing is lost there.)
+      if(r.tc){ var e=r.tc.byKey[normTaskPath(row.TaskPath)] || r.tc.byKey[normTaskPath(row.TaskPath)+"|del"];
+        if(e){ e.used=true; fillReg(row,e); row.RegStatus=e.del?"xml-only":"matched"; }   // only a DELETED registration left: the XML is unregistered
+        else if(/^(ok|not-utf16|malformed)$/.test(row.ParseStatus)) row.RegStatus="xml-only"; } }
+    // every TaskCache entry no XML claimed becomes its own row (registered-only, tree-only, or deleted & recovered)
+    for(i=0;i<R.roots.length;i++){ r=R.roots[i]; if(!r.tc || r.shareWith) continue;   // a shared hive emits its leftovers once, from its owner root
+      for(j=0;j<r.tc.all.length;j++){ if(!r.tc.all[j].used) extra.push(regOnlyRow(r, r.tc.all[j])); } }
+    for(i=0;i<extra.length;i++) R.rows.push(extra[i]);
+    if(!R.rows.length){ runFail("Nothing to report: no task files were staged and the TaskCache sweep returned no task entries"+(R.warn.length?(" - "+R.warn.join(" ")):".")); return; }
+    for(i=0;i<R.rows.length;i++){ row=R.rows[i];
+      if(row.FileTimeSource==="vr-metadata"){ row.ChangedUtc=row.FileModifiedUtc; row.ChangedSource="vr-metadata"; }
+      else if(row.TreeLastWriteUtc){ row.ChangedUtc=row.TreeLastWriteUtc; row.ChangedSource="taskcache-tree"; }
+      else if(row.RegCreatedUtc && row.ParseStatus==="no-xml"){ row.ChangedUtc=row.RegCreatedUtc; row.ChangedSource="taskcache-created"; }
+      else if(row.FileModifiedUtc){ row.ChangedUtc=row.FileModifiedUtc; row.ChangedSource=row.FileTimeSource; } }
+    // write the one CSV
+    var lines=[CSVCOLS.join(",")];
+    for(i=0;i<R.rows.length;i++){ var cells=[]; for(j=0;j<CSVCOLS.length;j++) cells.push(cq(R.rows[i][CSVCOLS[j]])); lines.push(cells.join(",")); }
+    var name=R.stamp+"_SchedTasks_Output.csv", path=R.outdir+"\\"+name;
+    try{ var fso=new ActiveXObject("Scripting.FileSystemObject"); if(!fso.FolderExists(R.outdir)) runBat(['mkdir "'+batEsc(R.outdir)+'" > "__LOG__" 2>&1']); }catch(em){}
+    writeUtf8(path, lines.join("\r\n")+"\r\n");
+    cleanupStage(R.stage);
+    var nTc=0, nMeta=0; for(i=0;i<R.roots.length;i++){ if(R.roots[i].tc) nTc++; if(R.roots[i].meta) nMeta++; }
+    appendLog("Wrote "+path+" - "+R.rows.length+" row(s) from "+R.roots.length+" root(s); TaskCache cross-check on "+nTc+", collection time metadata on "+nMeta+".");
+    for(i=0;i<R.warn.length;i++) appendLog("WARNING: "+R.warn[i]);
+    LASTOUTDIR=R.outdir;
+    writeRunInfo(R.outdir, R.inp, [{name:name}]);
+    var all=listCsvFiles(R.outdir); PRODUCED=all; populateProduced(all);
+    try{ $("producedSel").value=path; }catch(e4){}
+    BUSY=false; $("procBtn").disabled=false; procStop(true);
+    loadCsvFile(path);
+    patchRunInfoSummary(buildRunSummary());   // rows are scored now - add the triage headline to the runinfo entry
+    var msg="Processed "+nf(R.rows.length)+" task(s) from "+R.roots.length+" root(s)"+(nTc?(" with TaskCache cross-check on "+nTc):" (no TaskCache cross-check)")+" -> "+name;
+    if(R.warn.length) setStatus(msg+" - "+R.warn.length+" warning(s), see log","err"); else setStatus(msg,"ok");
+  }catch(ex){ runFail("Processing failed while joining / writing: "+ex.message); }
+}
+
+function csvNameSet(dir){ var o={}, l=listCsvFiles(dir); for(var i=0;i<l.length;i++) o[l[i].name]=true; return o; }
+function listCsvFiles(dir){
+  var fso=new ActiveXObject("Scripting.FileSystemObject"), out=[];
+  if(!fso.FolderExists(dir)) return out;
+  var e=new Enumerator(fso.GetFolder(dir).Files);
+  for(; !e.atEnd(); e.moveNext()){ var f=e.item(); if(/\.csv$/i.test(f.Name+"")) out.push({name:f.Name+"", path:f.Path+"", size:f.Size}); }
+  out.sort(function(a,b){ return a.name<b.name?1:(a.name>b.name?-1:0); });   // newest timestamp-prefix first
+  return out;
+}
+function fmtSize(n){ if(!n) return "0 B"; var u=["B","KB","MB","GB"], i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(i?1:0)+" "+u[i]; }
+function populateProduced(list){
+  var sel=$("producedSel"); sel.innerHTML="";
+  for(var i=0;i<list.length;i++){
+    var lab=list[i].name+"  ("+fmtSize(list[i].size)+")";
+    if(/_SchedTasks_Output\.csv$/i.test(list[i].name)) lab+="  -  one row per task (XML + TaskCache)";
+    var o=document.createElement("option"); o.value=list[i].path; o.text=lab; sel.add(o);
+  }
+  showEl("producedRow", list.length>0);
+}
+function openDir(){ var d=$("outDir").value; if(!d){ setStatus("No output directory set","err"); return; }
+  try{ new ActiveXObject("WScript.Shell").Run('explorer.exe "'+d+'"',1,false); }catch(e){ setStatus("Could not open folder: "+e.message,"err"); } }
+
+/* ---------- CSV parser (RFC4180) — line-split hybrid: native split for the bulk,
+   careful field parsing only for lines containing quotes; merges rows split across
+   newlines inside quoted fields. Orders of magnitude faster than char-by-char in MSHTML. */
+function countQuotes(s){ var c=0, idx=-1; while((idx=s.indexOf('"',idx+1))>=0) c++; return c; }
+function parseCSVLine(line){
+  if(line.indexOf('"')<0) return line.split(",");   // fast path: no quotes → plain split
+  var out=[], field="", q=false, i=0, n=line.length;
+  while(i<n){ var c=line.charAt(i);
+    if(q){ if(c==='"'){ if(line.charAt(i+1)==='"'){ field+='"'; i+=2; continue; } q=false; i++; continue; } field+=c; i++; continue; }
+    if(c==='"'){ q=true; i++; continue; }
+    if(c===','){ out.push(field); field=""; i++; continue; }
+    field+=c; i++;
+  }
+  out.push(field); return out;
+}
+function parseCSV(text){
+  if(text.charCodeAt(0)===0xFEFF) text=text.substring(1);
+  var lines=text.split("\n"), rows=[], i=0, n=lines.length;
+  while(i<n){
+    var line=lines[i]; i++;
+    // a quoted field may contain a newline → merge continuation lines until quotes balance
+    var qc=countQuotes(line);
+    while((qc%2)===1 && i<n){ line+="\n"+lines[i]; qc+=countQuotes(lines[i]); i++; }
+    if(line.charAt(line.length-1)==='\r') line=line.substring(0,line.length-1);
+    if(line==="") continue;
+    rows.push(parseCSVLine(line));
+  }
+  return rows;
+}
+
+/* ---------- ingest dispatch ---------- */
+function loadCsvFile(path){
+  try{
+    var text=readUtf8(path);
+    var raw=parseCSV(text);
+    if(!raw||!raw.length){ setStatus("Empty / unparseable CSV","err"); return; }
+    var idx={}, head=raw[0];
+    for(var h=0;h<head.length;h++) idx[trimStr(head[h])]=h;
+    if(("TaskPath" in idx) && ("ActionCommands" in idx) && ("RunAs" in idx))
+      ingestTasks(raw, idx, baseName(path));
+    else
+      ingestGeneric(raw, head, baseName(path));
+  }catch(e){ setStatus("Could not read CSV: "+e.message,"err"); }
+}
+function cell(rw,i){ return (i!=null&&i>=0&&i<rw.length)?rw[i]:""; }
+function numv(v){ var x=parseFloat(v); return isFinite(x)?x:0; }
+
+/* ---------- scheduled-task ingest (columns = CSVCOLS, written by this app) ---------- */
+function folderKey(p){ var parts=String(p||"").split("\\");
+  if(parts.length<=2) return "\\";                                         // root-level task
+  if(/^microsoft$/i.test(parts[1]) && parts.length>3 && /^windows$/i.test(parts[2]))
+    return parts.length>4?("\\"+parts[1]+"\\"+parts[2]+"\\"+parts[3]):("\\"+parts[1]+"\\"+parts[2]);
+  return "\\"+parts[1]; }
+function splitCmds(s){ var out=[], p=String(s||"").split(" | "); for(var i=0;i<p.length;i++){ var t=trimStr(p[i]); if(t) out.push(t); } return out; }
+function launcherName(c){
+  var s=trimStr(String(c||""));
+  if(s.charAt(0)==='"'){ var q=s.indexOf('"',1); s=(q>0)?s.substring(1,q):s.substring(1); }
+  s=s.replace(/"/g,"");
+  var b=s.substring(Math.max(s.lastIndexOf("\\"),s.lastIndexOf("/"))+1).toLowerCase();
+  return trimStr(b.replace(/\.(exe|com)\b.*$/,""));
+}
+function ingestTasks(raw, idx, srcLabel){
+  ROWS=[];
+  var users={}, roots={}, i, c;
+  for(var r=1;r<raw.length;r++){
+    var rw=raw[r]; if(rw.length<4) continue;
+    var rec={};
+    for(c=0;c<CSVCOLS.length;c++) rec[CSVCOLS[c]]=cell(rw, (CSVCOLS[c] in idx)?idx[CSVCOLS[c]]:-1);
+    if(!rec.TaskPath && !rec.SourceFile) continue;
+    rec.name=rec.TaskPath||baseName(rec.SourceFile);
+    rec.pathL=String(rec.TaskPath).toLowerCase();
+    rec.inMs=/^\\microsoft\\/i.test(rec.TaskPath);
+    rec.folder=folderKey(rec.TaskPath);
+    rec.ms=msOf(rec.ChangedUtc); rec.day=dayOf(rec.ChangedUtc);
+    rec.user=rec.RunAs||"(unknown)";
+    rec.repSecs=isoDurSecs(rec.MinRepetition);
+    rec.cmds=splitCmds(rec.ActionCommands).concat(splitCmds(rec.RegActionCommands));
+    rec.actRaw=rec.AllActions+(rec.RegActions && rec.RegActions!==rec.AllActions?(" || "+rec.RegActions):"");
+    rec.actL=rec.actRaw.toLowerCase();
+    rec.iocBlob=[rec.TaskPath,rec.Author,rec.Description,rec.RunAs,rec.AllActions,rec.WorkingDir,rec.ComClassId,rec.ComData,rec.RegActions,rec.Source].join(" ").toLowerCase();
+    var bl=[]; for(c=0;c<CSVCOLS.length;c++) bl.push(rec[CSVCOLS[c]]);
+    rec.blob=bl.join(" ").toLowerCase();
+    rec.tags=[]; rec.reasons=[]; rec.score=0; rec.sus=false;
+    users[rec.user]=1; if(rec.TasksRoot) roots[rec.TasksRoot]=(roots[rec.TasksRoot]||0)+1;
+    ROWS.push(rec);
+  }
+  if(!ROWS.length){ ingestGeneric(raw, raw[0], srcLabel); return; }
+  rescoreAll();
+  setMode("tasks");
+  populateSourceFilter([]);
+  USERFILTER=""; TAGFILTER=""; ROOTFILTER=""; FOLDERFILTER="";
+  var uv=[], k; for(k in users){ if(users.hasOwnProperty(k)) uv.push(k); }
+  populateUserFilter(uv);
+  populateCountSel("rootSel","rootWrap",roots,"all roots",function(p){ return shortPathN(p,6); },2);
+  populateTagSel();
+  updateSkewNote();
+  $("results").className="";
+  var nRoot=0; for(k in roots){ if(roots.hasOwnProperty(k)) nRoot++; }
+  $("srcpill").innerHTML=nf(ROWS.length)+" tasks &middot; "+nf(nRoot)+" root(s) &middot; "+esc(srcLabel);
+  QUERY=""; $("q").value=""; DFROM=CASE_FROM?dayNum(CASE_FROM):0; DTO=CASE_TO?dayNum(CASE_TO):0; $("dfrom").value=CASE_FROM||""; $("dto").value=CASE_TO||"";
+  CURCAT="all"; highlightCat(); updateFolderChip();
+  SORTKEY=0; SORTDIR=1; TSORTKEY=0; TSORTDIR=-1; CSORTKEY=4; CSORTDIR=-1;
+  setView("tasks", true);
+  closeDetail();
+  var fl=0; for(i=0;i<ROWS.length;i++) if(ROWS[i].sus) fl++;
+  setStatus("Loaded "+nf(ROWS.length)+" task(s) - "+nf(fl)+" flagged","ok");
+  render();
+}
+function populateTagSel(){
+  var counts={}, i, j; for(i=0;i<ROWS.length;i++){ for(j=0;j<ROWS[i].tags.length;j++){ var t=ROWS[i].tags[j]; counts[t]=(counts[t]||0)+1; } }
+  populateCountSel("tagSel","tagWrap",counts,"any tag",null,1);
+  TAGFILTER="";
+}
+/* extraction-timezone skew: an unzip that stamps DOS zip times in the analysis box's local time shifts
+   every extracted file time by the box's UTC offset. Compare extracted times with an authoritative
+   source (collection metadata, else the TaskCache Tree LastWrite) and say so when most tasks agree. */
+function updateSkewNote(){
+  var el=$("skewWarn"); if(!el) return;
+  var b={}, n=0, src="", i, best=null, bestN=0;
+  for(i=0;i<ROWS.length;i++){ var r=ROWS[i], x=msOf(r.ExtractedModifiedUtc), a=0, s="";
+    if(!x) continue;
+    if(r.FileTimeSource==="vr-metadata"){ a=msOf(r.FileModifiedUtc); s="the collection's own file metadata"; }
+    else if(r.TreeLastWriteUtc){ a=msOf(r.TreeLastWriteUtc); s="the TaskCache Tree LastWrite times"; }
+    if(!a) continue;
+    var q=Math.round((x-a)/900000)*15; b[q]=(b[q]||0)+1; n++; if(!src) src=s; }
+  for(var k in b){ if(b.hasOwnProperty(k) && b[k]>bestN){ bestN=b[k]; best=+k; } }
+  if(n>=5 && best && bestN>=n*0.6){
+    var sg=best<0?"-":"+", ab=Math.abs(best), hh=Math.floor(ab/60), mm=ab%60;
+    el.innerHTML="&#9888; Extracted task-file times are offset by <b>"+sg+(hh<10?"0":"")+hh+":"+(mm<10?"0":"")+mm+"</b> from "+esc(src)+" for "+nf(bestN)+" of "+nf(n)+" tasks &mdash; the collection was most likely unzipped with a tool that stamped the ZIP's times in this machine's local timezone. Changed (UTC) uses the authoritative source; the raw extracted time is kept in ExtractedModifiedUtc.";
+    showEl("skewWarn",true);
+  } else { el.innerHTML=""; showEl("skewWarn",false); }
+}
+
+/* ---------- suspicion scoring (spec section 7, T1-T14; flagged = score >= 3) ----------
+   the case window NEVER scores (family rule). \Microsoft\ tasks are half-weighted on the two noisiest
+   rules (T2 LOLBIN, T5 USERPATH) - not exempt, because attackers hide tasks there. */
+function isUserPath(pL){
+  if(!pL) return false;
+  var L=["\\appdata\\","\\temp\\","\\tmp\\","\\users\\public\\","\\downloads\\","\\perflogs\\","\\$recycle.bin\\",
+    "\\windows\\tasks\\","\\system32\\tasks\\","%appdata%","%localappdata%","%temp%","%tmp%","%public%"];
+  for(var i=0;i<L.length;i++){ if(pL.indexOf(L[i])>=0) return true; }
+  // ProgramData counts only when NON-vendor (Microsoft's own subtree is routine)
+  if(pL.indexOf("\\programdata\\")>=0 && pL.indexOf("\\programdata\\microsoft\\")<0) return true;
+  if(pL.indexOf("%programdata%")>=0 && pL.indexOf("%programdata%\\microsoft\\")<0) return true;
+  return false;
+}
+/* T5 is about where the action RUNS FROM: the launched program, a working directory, or a script /
+   binary named in the arguments. A data or log file under ProgramData in the arguments is not enough. */
+var RUNFILE_RE=/(%[a-z]+%|[a-z]:)?\\[^"'|<>*?\r\n]*?\.(ps1|psm1|bat|cmd|vbs|vbe|js|jse|wsf|wsh|hta|exe|dll|scr|cpl|msi|jar|py|lnk)(?=[\s"',;)\]]|$)/g;
+function userPathHit(r){
+  var i, m, trusted=r.cmds.length>0;
+  for(i=0;i<r.cmds.length;i++){ var cl=String(r.cmds[i]).toLowerCase().replace(/"/g,"");
+    if(isUserPath(cl)) return true;
+    if(!/^([a-z]:|%[a-z]+%)\\(program files|program files \(x86\)|windows)\\/.test(cl) && !/^%(programfiles|programfiles\(x86\)|windir|systemroot)%\\/.test(cl)) trusted=false; }
+  // a working directory counts only when the program itself is not installed under Program Files / Windows
+  // (vendor updaters routinely run from Program Files with a ProgramData working directory)
+  m=trusted?[]:(r.actL.match(/\[in [^\]]+\]/g)||[]);
+  for(i=0;i<m.length;i++){ if(isUserPath(m[i].replace(/\]$/,"\\"))) return true; }
+  m=r.actL.match(RUNFILE_RE)||[];
+  for(i=0;i<m.length;i++){ if(isUserPath(m[i])) return true; }
+  return false;
+}
+function isOneShot(r){
+  if(r.DeleteExpired) return true;
+  if(r.TriggerTypes!=="TimeTrigger" || (+r.TriggerCount||0)!==1 || r.MinRepetition) return false;
+  var a=msOf(r.StartBoundary), b=msOf(r.EndBoundary);
+  return !!(a && b && b>=a && (b-a)<=86400000);
+}
+function normAct(s){ return String(s||"").toLowerCase().replace(/"/g,"").replace(/\s+/g," ").replace(/\s*\(partially decoded\)$/,""); }
+function actMismatch(r){
+  if(r.RegStatus!=="matched" || !r.RegActions || !r.AllActions) return false;
+  if(/partially decoded/.test(r.RegActions)) return false;
+  return normAct(r.AllActions)!==normAct(r.RegActions);
+}
+function rescoreAll(){ for(var i=0;i<ROWS.length;i++) scoreRec(ROWS[i]); }
+function scoreRec(r){
+  var tags=[], reasons=[], score=0, ms=r.inMs, non=!ms, i;
+  function add(n,tag,why){ score+=n; tags.push(tag); reasons.push(why+" (+"+n+")"); }
+  function info(tag,why){ tags.push(tag); reasons.push(why+" (+0)"); }
+  // T1 IOC / keyword hit
+  if(IOCS.length){ var hits=[];
+    for(i=0;i<IOCS.length;i++){ if(r.iocBlob.indexOf(IOCS[i])>=0){ hits.push(IOCS[i]); if(hits.length>=3) break; } }
+    if(hits.length) add(3,"IOC","IOC/keyword hit: "+hits.join(", ")); }
+  // T2 launcher is a script host / LOLBin (every action, XML and registry copies)
+  var lol=[], seenL={};
+  for(i=0;i<r.cmds.length;i++){ var ln=launcherName(r.cmds[i]); if(LOLBINS[ln] && !seenL[ln]){ seenL[ln]=1; lol.push(ln); } }
+  if(lol.length) add(ms?1:2,"LOLBIN","Launches a script host / LOLBin: "+lol.join(", ")+(ms?" (Microsoft tree - half weight)":""));
+  // T3 cradle / obfuscation
+  if(CRADLE_RE.test(r.actL) || B64_RE.test(r.actRaw)) add(2,"CRADLE","Download cradle, IEX, encoded command or hidden window in the arguments");
+  // T4 remote content
+  if(/(https?|ftp):\/\//.test(r.actL) || UNC_RE.test(r.actL)) add(2,"REMOTE","Remote content (URL or UNC share) in the action");
+  // T5 user-writable / staging location
+  if(userPathHit(r)) add(ms?1:2,"USERPATH","Action runs from a user-writable or staging location (program, working directory or a script / binary in the arguments)"+(ms?" (Microsoft tree - half weight)":""));
+  // T6 privileged principal (non-Microsoft)
+  if(non && (r.RunAs==="SYSTEM" || /^highestavailable$/i.test(r.RunLevel))) add(1,"SYSTEM","Non-Microsoft task runs as SYSTEM / with highest privileges");
+  // T7 non-interactive credential logon (non-Microsoft)
+  if(non && /^s4u$/i.test(r.LogonType)) add(1,"S4U","S4U logon - runs whether or not the user is logged on, no stored password");
+  else if(non && /^password$/i.test(r.LogonType)) add(1,"PASSWORD","Stored-password logon - credentials are cached for this task");
+  // T8 one-shot
+  if(isOneShot(r)) add(1,"ONESHOT","One-shot task (single time trigger ending <= 24 h after it starts, or delete-after-expiry) - the remote-push / immediate-task shape");
+  // T9 hidden / beacon-like repetition (non-Microsoft)
+  if(non && r.Hidden==="true") add(1,"HIDDEN","Non-Microsoft task is marked Hidden");
+  if(non && r.repSecs>0 && r.repSecs<=900) add(1,"BEACON","Non-Microsoft task repeats every "+r.MinRepetition+" (<= 15 min)");
+  // T10 structural anomalies
+  var ps=r.ParseStatus;
+  if(ps==="malformed"||ps==="empty"||ps==="oversize"||ps==="unreadable") add(2,"MALFORMED","Task file is "+ps+" - the Task Scheduler always writes well-formed XML");
+  else if(ps==="not-task") add(2,"NOTTASK","Non-task file stored inside a Tasks folder (a world-writable spot used to stash payloads)");
+  else if(ps==="not-utf16") add(1,"NOTUTF16","Task file is not UTF-16 (the Task Scheduler always writes UTF-16) - hand-made or dropped");
+  else if(ps==="job"){ if(/(^|\\)at\d+\.job$/i.test(r.SourceFile)) add(3,"ATJOB","Legacy at.exe job (At<n>.job) - classic remote-scheduling trace"); else add(1,"JOB","Legacy .job task file"); }
+  if(/\\syswow64\\tasks$/i.test(r.TasksRoot)) add(2,"WOW64","Task file under SysWOW64\\Tasks - the scheduler never writes there");
+  // T11-T14 TaskCache cross-check
+  var rs=r.RegStatus;
+  if(r.TreeSD==="no" && rs!=="deleted") add(3,"NOSD","TaskCache Tree key has no SD value - hidden from schtasks and the Task Scheduler UI (Tarrask technique)");
+  if(rs==="reg-only") add(2,"REGONLY","Registered in TaskCache but the task XML is missing - still runs, invisible to anyone reading the Tasks folder");
+  else if(rs==="tree-only"){
+    // normal deletion removes the Tree key, the Tasks key and the XML together. Microsoft upgrade leftovers
+    // (Index 0) are the routine exception; a third-party Tree leaf left behind is residue of a task removed
+    // some other way - across 17 real hosts these were almost all the attacker's deleted tasks.
+    if(ms && r.TreeIndex==="0") info("STALE","Stale Microsoft TaskCache Tree entry (Index 0, no Tasks key, no XML) - normal upgrade leftover");
+    else add(ms?2:3,"TREEONLY","TaskCache Tree entry left behind with no Tasks key and no XML - residue of a "+(ms?"":"non-Microsoft ")+"task removed outside a normal delete (its name and Tree LastWrite are all that remain)"); }
+  else if(rs==="xml-only") add(1,"XMLONLY","Task XML is not registered in TaskCache - dropped file, cleaned registry, or the hive copy predates it");
+  else if(rs==="deleted") add(1,"REGDELETED","Deleted task recovered from the SOFTWARE hive (registry slack)");
+  if(actMismatch(r)) add(2,"ACTMISMATCH","TaskCache's copy of the actions differs from the task XML");
+  // tag-only context (+0) - candidates to promote after tuning
+  if((+r.ActionCount||0)>1) info("MULTI","Task has "+r.ActionCount+" actions");
+  if(r.ActionType==="ComHandler") info("COM","COM-handler action (CLSID "+r.ComClassId+")");
+  if(r.Enabled==="false") info("DISABLED","Task is disabled");
+  if(non && /^[^\\\s]+\\[^\\]+$/.test(r.Author) && !/^(nt authority|microsoft corporation)\\/i.test(r.Author)) info("ACCT-AUTHOR","Author is a DOMAIN\\user account ("+r.Author+")");
+  if(r.Uri && r.ParseStatus!=="no-xml" && normTaskPath(r.Uri)!==normTaskPath(r.TaskPath)) info("URIMISMATCH","<URI> ("+r.Uri+") differs from the file's location");
+  r.tags=tags; r.reasons=reasons; r.score=score; r.sus=(score>=SUS_MIN);
+}
+
+/* ---------- aggregates / overview ---------- */
+function topList(obj,n){ var a=[],k; for(k in obj){ if(obj.hasOwnProperty(k)) a.push([k,obj[k]]); }
+  a.sort(function(x,y){ return y[1]-x[1]; }); return a.slice(0,n); }
+function stat(n,l,tip){ return '<span class="stat"'+(tip?(' title="'+esc(tip)+'"'):'')+'><span class="n">'+esc(n)+'</span><span class="l">'+esc(l)+'</span></span>'; }
+function bar(label,frac,val,q,attr){
+  var lc=q?(' lnk" '+(attr||"data-q")+'="'+esc(q)):'';
+  return '<div class="brow"><span class="blab'+lc+'" title="'+esc(label)+'">'+esc(label)+'</span>'
+    +'<span class="btrack"><span class="bfill" style="width:'+(frac*100).toFixed(1)+'%"></span></span>'
+    +'<span class="bval">'+esc(val)+'</span></div>';
+}
+function listRow(label,val,q,cls){
+  var lc=q?' lnk" data-q="'+esc(q):'';
+  return '<div class="brow"><span class="blab'+lc+'" title="'+esc(label)+'" style="width:58%">'+esc(label)+'</span>'
+    +'<span class="bval" style="width:38%;'+(cls||"")+'">'+esc(val)+'</span></div>';
+}
+function fmtShortTs(s){ var m=String(s).match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/); return m?(m[1]+" "+m[2]):String(s||""); }
+function msToTs(ms){ var d=new Date(ms); function p(x){return (x<10?"0":"")+x;}
+  return d.getUTCFullYear()+"-"+p(d.getUTCMonth()+1)+"-"+p(d.getUTCDate())+" "+p(d.getUTCHours())+":"+p(d.getUTCMinutes())+":"+p(d.getUTCSeconds()); }
+function hasTag(r,t){ for(var i=0;i<r.tags.length;i++){ if(r.tags[i]===t) return true; } return false; }
+var REGTAGS={NOSD:1,REGONLY:1,TREEONLY:1,XMLONLY:1,REGDELETED:1,ACTMISMATCH:1};
+function hasRegTag(r){ for(var i=0;i<r.tags.length;i++){ if(REGTAGS[r.tags[i]]) return true; } return false; }
+function renderPfAgg(rows){
+  var i, r, users={}, roots={}, nonMs=0, susN=0, iocN=0, maxS=0, minMs=0, maxMs=0, st={};
+  for(i=0;i<rows.length;i++){ r=rows[i];
+    users[r.user]=(users[r.user]||0)+1; roots[r.TasksRoot]=1;
+    if(!r.inMs) nonMs++; if(r.sus) susN++; if(hasTag(r,"IOC")) iocN++; if(r.score>maxS) maxS=r.score;
+    if(r.RegStatus) st[r.RegStatus]=(st[r.RegStatus]||0)+1;
+    if(r.ms){ if(!minMs||r.ms<minMs) minMs=r.ms; if(r.ms>maxMs) maxMs=r.ms; } }
+  var nU=0, nR=0, k; for(k in users){ if(users.hasOwnProperty(k)) nU++; } for(k in roots){ if(roots.hasOwnProperty(k)) nR++; }
+  var reg="";
+  if(st.matched||st["xml-only"]||st["reg-only"]||st["tree-only"]||st.deleted)
+    reg=stat(nf(st.matched||0),"TaskCache matched")+(st["xml-only"]?stat(nf(st["xml-only"]),"XML only","Task XML with no TaskCache registration"):"")
+      +((st["reg-only"]||st["tree-only"])?stat(nf((st["reg-only"]||0)+(st["tree-only"]||0)),"registry only","Registered in TaskCache with no XML on disk (tree-only includes stale Microsoft leftovers)"):"")
+      +(st.deleted?stat(nf(st.deleted),"deleted (recovered)","Deleted tasks recovered from the SOFTWARE hive"):"");
+  var rng=minMs?(fmtShortTs(msToTs(minMs))+" -> "+fmtShortTs(msToTs(maxMs))):"-";
+  $("statbar").innerHTML=stat(nf(rows.length),"tasks")+stat(nf(nonMs),"non-Microsoft")+stat(nf(susN),"flagged")
+    +(IOCS.length?stat(nf(iocN),"IOC hits"):"")+stat(String(maxS),"max score")+stat(nf(nU),"run-as accounts")+(nR>1?stat(nf(nR),"roots"):"")+reg
+    +'<span class="stat" style="min-width:250px"><span class="n" style="font-size:12px">'+esc(rng)+'</span><span class="l">Changed range (UTC)</span></span>';
+  var top=topList(users,12), h="", max=top.length?top[0][1]:1;
+  for(i=0;i<top.length;i++) h+=bar(top[i][0], max?top[i][1]/max:0, nf(top[i][1]), top[i][0], "data-user");
+  $("topExes").innerHTML=h||'<span class="muted">none</span>';
+  var byNew=rows.slice(0); byNew.sort(function(a,b){ return b.ms-a.ms; });
+  h=""; for(i=0;i<byNew.length&&i<12;i++){ r=byNew[i]; if(!r.ms) break; h+=listRow(r.name, fmtShortTs(r.ChangedUtc), r.name); }
+  $("topNew").innerHTML=h||'<span class="muted">none</span>';
+  var sus=[]; for(i=0;i<rows.length;i++){ if(rows[i].sus) sus.push(rows[i]); }
+  sus.sort(function(a,b){ return b.score-a.score || b.ms-a.ms; });
+  h=""; for(i=0;i<sus.length&&i<12;i++){ r=sus[i]; h+=listRow(r.name+"  ["+r.tags.join(",")+"]", "score "+r.score, r.name, "color:#ff6b6b"); }
+  $("topSus").innerHTML=h||'<span class="ok">No flagged tasks</span>';
+}
+
+/* ---------- tasks table ---------- */
+function actionText(r){
+  var s=r.Command?(r.Command+(r.Arguments?(" "+r.Arguments):"")):(r.ComClassId?("COM "+r.ComClassId+(r.ComData?(" "+r.ComData):"")):r.AllActions);
+  var n=+r.ActionCount||0; return s+(n>1?("  (+"+(n-1)+" more)"):"");
+}
+function stateHtml(r){
+  var h=(r.ParseStatus==="no-xml")?'<span class="chip">no XML</span>':((r.Enabled==="false")?'<span class="muted">disabled</span>':'<span>enabled</span>');
+  if(r.Hidden==="true") h+='<span class="chip warn">hidden</span>';
+  var rs=r.RegStatus;
+  if(rs==="matched") h+='<span class="chip">reg</span>';
+  else if(rs) h+='<span class="chip '+(rs==="tree-only"&&hasTag(r,"STALE")?"":"bad")+'">'+esc(rs)+'</span>';
+  if(r.ParseStatus && r.ParseStatus!=="ok" && r.ParseStatus!=="no-xml") h+='<span class="chip bad">'+esc(r.ParseStatus)+'</span>';
+  return h;
+}
+function stateKey(r){ return (r.ParseStatus==="no-xml"?"0":"1")+(r.Enabled==="false"?"0":"1")+(r.Hidden==="true"?"h":"")+r.RegStatus; }
+function srcChip(s){ var m={"vr-metadata":"vr","taskcache-tree":"reg","taskcache-created":"reg","file-extracted":"file?","file":"file"};
+  var t={"vr-metadata":"Velociraptor collection metadata (true UTC file time)","taskcache-tree":"TaskCache Tree key LastWrite (UTC)","taskcache-created":"TaskCache created time (UTC)","file-extracted":"Extracted file time - may carry the unzip box's timezone error","file":"File time from the file system"};
+  return s?(' <span class="chip'+(s==="file-extracted"?" warn":"")+'" title="'+esc(t[s]||s)+'">'+esc(m[s]||s)+'</span>'):""; }
+var COLS=[
+  {h:"Tags", sk:function(r){return -r.score*10+(r.inMs?1:0);}, cell:function(r){return '<td class="first">'+tagHtml(r)+'</td>';}},
+  {h:"Task path", sk:function(r){return r.pathL;}, cell:function(r){return '<td class="mono'+(r.inMs?' muted':'')+'" title="'+esc(r.TaskPath)+'">'+esc(r.TaskPath)+'</td>';}},
+  {h:"Action", sk:function(r){return r.actL;}, cell:function(r){var a=actionText(r); return '<td class="mono" title="'+esc(r.AllActions)+'">'+esc(a)+'</td>';}},
+  {h:"Run as", sk:function(r){return r.user.toLowerCase();}, cell:function(r){return '<td class="mono lnk" data-user="'+esc(r.user)+'" title="'+esc(r.user+(r.LogonType?(" / "+r.LogonType):"")+(r.RunLevel?(" / "+r.RunLevel):""))+' - click to filter to this account">'+esc(r.user)+'</td>';}},
+  {h:"Triggers", sk:function(r){return String(r.TriggerSummary).toLowerCase();}, cell:function(r){return '<td class="mono" title="'+esc(r.TriggerSummary)+'">'+esc(r.TriggerSummary)+'</td>';}},
+  {h:"State", sk:stateKey, cell:function(r){return '<td>'+stateHtml(r)+'</td>';}},
+  {h:"Author", sk:function(r){return String(r.Author).toLowerCase();}, cell:function(r){return '<td class="mono muted" title="'+esc(r.Author)+'">'+esc(r.Author)+'</td>';}},
+  {h:"Last run (UTC)", sk:function(r){return msOf(r.RegLastStartUtc);}, cell:function(r){return '<td class="mono">'+esc(r.RegLastStartUtc)+'</td>';}},
+  {h:"Changed (UTC)", sk:function(r){return r.ms;}, cell:function(r){return '<td class="mono">'+esc(r.ChangedUtc)+srcChip(r.ChangedSource)+'</td>';}}
+];
+function tagHtml(r){
+  var t="", i, why=esc(r.reasons.join("; "));
+  if(r.sus) t+='<span class="tag sus" title="'+why+'">SUS '+r.score+'</span>';
+  for(i=0;i<r.tags.length;i++){ var g=r.tags[i], cls="gen";
+    if(g==="IOC") cls="ioc"; else if(g==="USERPATH") cls="usr"; else if(g==="LOLBIN"||g==="CRADLE"||g==="REMOTE") cls="lol";
+    else if(REGTAGS[g]) cls="reg"; else if(g==="ONESHOT"||g==="BEACON"||g==="HIDDEN") cls="rare";
+    else if(g==="STALE"||g==="DISABLED") cls="off";
+    t+='<span class="tag '+cls+'" title="'+why+'">'+esc(g)+'</span>'; }
+  return t;
+}
+function filteredPf(){
+  var out=[];
+  for(var i=0;i<ROWS.length;i++){
+    var r=ROWS[i];
+    if(USERFILTER && r.user!==USERFILTER) continue;
+    if(TAGFILTER && !hasTag(r,TAGFILTER)) continue;
+    if(ROOTFILTER && r.TasksRoot!==ROOTFILTER) continue;
+    if(FOLDERFILTER && r.folder!==FOLDERFILTER) continue;
+    if(CURCAT==="sus"&&!r.sus) continue;
+    if(CURCAT==="nonms"&&r.inMs) continue;
+    if(CURCAT==="ioc"&&!hasTag(r,"IOC")) continue;
+    if(CURCAT==="exec"&&!(r.ActionType==="Exec"||r.cmds.length)) continue;
+    if(CURCAT==="com"&&!hasTag(r,"COM")) continue;
+    if(CURCAT==="hidden"&&r.Hidden!=="true") continue;
+    if(CURCAT==="disabled"&&r.Enabled!=="false") continue;
+    if(CURCAT==="reg"&&!hasRegTag(r)) continue;
+    if(DFROM&&(!r.day||r.day<DFROM)) continue;
+    if(DTO&&(!r.day||r.day>DTO)) continue;
+    if(QUERY){ if(r.blob.indexOf(QUERY)<0) continue; }
+    out.push(r);
+  }
+  return out;
+}
+function updateCatCounts(){
+  var c={all:ROWS.length,sus:0,nonms:0,ioc:0,exec:0,com:0,hidden:0,disabled:0,reg:0};
+  for(var i=0;i<ROWS.length;i++){ var r=ROWS[i];
+    if(r.sus)c.sus++; if(!r.inMs)c.nonms++; if(hasTag(r,"IOC"))c.ioc++; if(r.ActionType==="Exec"||r.cmds.length)c.exec++;
+    if(hasTag(r,"COM"))c.com++; if(r.Hidden==="true")c.hidden++; if(r.Enabled==="false")c.disabled++; if(hasRegTag(r))c.reg++; }
+  var names={all:"All",sus:"Flagged",nonms:"Non-Microsoft",ioc:"IOC hits",exec:"Exec",com:"COM handler",hidden:"Hidden",disabled:"Disabled",reg:"Registry anomalies"};
+  var bs=$("pfCats").getElementsByTagName("button");
+  for(var j=0;j<bs.length;j++){ var k=bs[j].getAttribute("data-cat");
+    if(k) bs[j].innerHTML=names[k]+" ("+nf(c[k])+")"; }
+}
+function highlightCat(){
+  var bs=$("pfCats").getElementsByTagName("button");
+  for(var j=0;j<bs.length;j++){ if(bs[j].getAttribute("data-cat")) bs[j].className=(bs[j].getAttribute("data-cat")===CURCAT)?"btn on":"btn"; }
+}
+function viewTitle(v){ return (v==="time")?"Task timeline (by Changed, UTC)":((v==="folders")?"Task folders":"Scheduled tasks"); }
+function setView(v, quiet){
+  VIEW=v;
+  $("vTasks").className=(v==="tasks")?"btn on":"btn";
+  $("vTime").className=(v==="time")?"btn on":"btn";
+  $("vFolders").className=(v==="folders")?"btn on":"btn";
+  $("tableTitle").innerHTML=viewTitle(v);
+  if(!quiet) render();
+}
+function updateFolderChip(){
+  var el=$("folderChip"); if(!el) return;
+  if(FOLDERFILTER){ el.innerHTML='<span class="sep"></span><span class="chip warn">folder: '+esc(FOLDERFILTER)+' <span class="lnk" data-clearfolder="1" title="Clear the folder filter">&times;</span></span>'; showEl("folderChip",true); }
+  else { el.innerHTML=""; showEl("folderChip",false); }
+}
+function render(){
+  if(MODE==="generic"){ renderGeneric(); return; }
+  if(VIEW==="time"){ renderTime(); return; }
+  if(VIEW==="folders"){ renderFolders(); return; }
+  if(!ROWS.length) return;
+  var rows=filteredPf();
+  renderPfAgg(rows);
+  updateCatCounts();
+  var sk=COLS[SORTKEY].sk, dir=SORTDIR;
+  rows.sort(function(a,b){ var x=sk(a),y=sk(b);
+    if(typeof x==="number"&&typeof y==="number"){ if(x!==y) return (x-y)*dir; }
+    else { x=String(x); y=String(y); if(x!==y) return x<y?-dir:dir; }
+    return a.pathL<b.pathL?-1:(a.pathL>b.pathL?1:0); });
+  var shown=rows.length>MAXROWS?MAXROWS:rows.length;
+  var html="<thead><tr>";
+  for(var c=0;c<COLS.length;c++){
+    var arrow=(SORTKEY===c)?(SORTDIR>0?" &#9650;":" &#9660;"):"";
+    html+='<th data-k="'+c+'">'+esc(COLS[c].h)+arrow+'</th>';
+  }
+  html+="</tr></thead><tbody>";
+  for(var i=0;i<shown;i++){
+    var r=rows[i];
+    html+='<tr data-i="'+i+'"'+(r.sus?' class="sus"':'')+' style="cursor:pointer">';
+    for(var k=0;k<COLS.length;k++){ html+=COLS[k].cell(r); }
+    html+="</tr>";
+  }
+  html+="</tbody>";
+  $("tbl").innerHTML=html;
+  $("count").innerHTML=nf(rows.length)+" tasks"+(shown<rows.length?(" (showing "+nf(shown)+")"):"")+maxRowsWarn(shown,rows.length);
+  wireHeaders();
+  setupColResize();
+  applyFreeze();
+  window.__viewRows=rows;
+}
+function wireHeaders(){
+  var ths=$("tbl").getElementsByTagName("th");
+  for(var i=0;i<ths.length;i++){ ths[i].onclick=function(e){
+    e=e||window.event; var t=e.target||e.srcElement;
+    if(t && /\bcgrip\b/.test(t.className+"")) return;   // resize-grip interactions must not sort
+    var k=parseInt(this.getAttribute("data-k"),10);
+    if(SORTKEY===k) SORTDIR*=-1; else { SORTKEY=k; SORTDIR=1; }
+    render();
+  }; }
+}
+function applyFreeze(){
+  var sc=$("tblScroll"); if(!sc) return;
+  var ths=$("tbl").getElementsByTagName("th"); var y=sc.scrollTop;
+  for(var i=0;i<ths.length;i++){ ths[i].style.top=y+"px"; }
+}
+
+/* ---------- settings sidecar (currently: per-view column widths) ----------
+   Tiny JSON next to the .hta; silently a no-op where the folder is unwritable. */
+var SETTINGS={};
+function settingsPath(){ var d=htaFolder(); return d?(d+"\\SchedTasks-Analyzer.settings.json"):""; }
+function loadSettings(){
+  try{ var p=settingsPath();
+    if(p && fileExists(p)){ var o=JSON.parse(readUtf8(p)); if(o && typeof o==="object") SETTINGS=o; }
+  }catch(e){ SETTINGS={}; }
+  if(!SETTINGS) SETTINGS={};
+  if(SETTINGS.colw && typeof SETTINGS.colw==="object") COLW=SETTINGS.colw;
+}
+function saveSettings(){ try{ var p=settingsPath(); if(p) writeUtf8(p, JSON.stringify(SETTINGS)); }catch(e){} }
+
+/* ---------- resizable columns (ported from DFIR-Artifact-Finder v0.2.1) ----------
+   Drag a header's right edge to resize; double-click the edge to reset the view's widths.
+   Widths are stored per view ({tasks:[..], time:[..], folders:[..], generic:[..]}) because each
+   view has its own column set; a stored array whose length no longer matches the header count
+   is ignored (auto-reset for that view). */
+var COLW={};      // per-view px widths once the user resizes (persisted in SETTINGS.colw)
+var DRAG=null;    // active column-drag state
+function colwKey(){ return (MODE==="generic")?"generic":((VIEW==="time")?"time":((VIEW==="folders")?"folders":"tasks")); }
+function curZoom(){
+  try{ var el=$("content");
+    var z=parseFloat(el.style.zoom||(el.currentStyle&&el.currentStyle.zoom)||"");
+    if(!z && window.getComputedStyle) z=parseFloat(getComputedStyle(el).zoom);
+    return (z&&z>0)?z:1;
+  }catch(e){ return 1; }
+}
+function setupColResize(){
+  var tbl=$("tbl"); if(!tbl) return;
+  var ths=tbl.getElementsByTagName("th"); if(!ths.length) return;
+  var key=colwKey(), w=COLW[key];
+  if(w && w.length===ths.length){
+    tbl.style.tableLayout="fixed"; tbl.style.width="auto";
+    for(var j=0;j<ths.length;j++) ths[j].style.width=w[j]+"px";
+  } else {
+    tbl.style.tableLayout=""; tbl.style.width="";   // the one table is shared by all views — undo a previous view's fixed layout
+  }
+  for(var i=0;i<ths.length;i++){
+    var g=document.createElement("div");
+    g.className="cgrip"; g.setAttribute("data-ci",String(i));
+    g.title="Drag to resize column — double-click to reset all widths";
+    g.onmousedown=gripDown; g.ondblclick=gripReset;
+    ths[i].appendChild(g);
+  }
+}
+function gripDown(e){
+  e=e||window.event;
+  var ci=parseInt(this.getAttribute("data-ci"),10);
+  var tbl=$("tbl"), ths=tbl.getElementsByTagName("th");
+  if(isNaN(ci)||ci<0||ci>=ths.length) return false;
+  var key=colwKey(), w=COLW[key];
+  if(!w || w.length!==ths.length){          // first drag: freeze the browser's current widths
+    w=[]; for(var i=0;i<ths.length;i++) w.push(ths[i].offsetWidth);
+    COLW[key]=w;
+    tbl.style.tableLayout="fixed"; tbl.style.width="auto";
+    for(var j=0;j<ths.length;j++) ths[j].style.width=w[j]+"px";
+  }
+  DRAG={key:key, ci:ci, x:(e.clientX||0), w:w[ci], th:ths[ci], z:curZoom()};
+  document.onmousemove=gripMove; document.onmouseup=gripUp;
+  document.onselectstart=function(){ return false; };
+  if(e.preventDefault) e.preventDefault(); e.returnValue=false;
+  if(e.stopPropagation) e.stopPropagation(); e.cancelBubble=true;
+  return false;
+}
+function gripMove(e){
+  e=e||window.event; if(!DRAG) return false;
+  var w=Math.round(DRAG.w+((e.clientX||0)-DRAG.x)/DRAG.z);
+  if(w<40) w=40; if(w>1600) w=1600;
+  COLW[DRAG.key][DRAG.ci]=w; DRAG.th.style.width=w+"px";
+  return false;
+}
+function gripUp(){
+  document.onmousemove=null; document.onmouseup=null; document.onselectstart=null;
+  if(DRAG){ DRAG=null; SETTINGS.colw=COLW; try{ saveSettings(); }catch(e){} }
+}
+function gripReset(e){
+  e=e||window.event;
+  document.onmousemove=null; document.onmouseup=null; document.onselectstart=null; DRAG=null;
+  COLW[colwKey()]=null; SETTINGS.colw=COLW; try{ saveSettings(); }catch(er){}
+  var tbl=$("tbl"); if(tbl){ tbl.style.tableLayout=""; tbl.style.width=""; }
+  render();
+  setStatus("Column widths reset","ok");
+  if(e){ if(e.stopPropagation) e.stopPropagation(); e.cancelBubble=true; }
+  return false;
+}
+
+/* ---------- timeline view (same tasks sorted by Changed) ---------- */
+var TCOLS=[
+  {h:"Changed (UTC)", sk:function(r){return r.ms;}, cell:function(r){return '<td class="mono">'+esc(r.ChangedUtc)+srcChip(r.ChangedSource)+'</td>';}},
+  {h:"Tags", sk:function(r){return -r.score;}, cell:function(r){return '<td class="first">'+tagHtml(r)+'</td>';}},
+  {h:"Task path", sk:function(r){return r.pathL;}, cell:function(r){return '<td class="mono'+(r.inMs?' muted':'')+'" title="'+esc(r.TaskPath)+'">'+esc(r.TaskPath)+'</td>';}},
+  {h:"Action", sk:function(r){return r.actL;}, cell:function(r){return '<td class="mono" title="'+esc(r.AllActions)+'">'+esc(actionText(r))+'</td>';}},
+  {h:"Run as", sk:function(r){return r.user.toLowerCase();}, cell:function(r){return '<td class="mono lnk" data-user="'+esc(r.user)+'" title="click to filter to this account">'+esc(r.user)+'</td>';}},
+  {h:"Registered (UTC)", sk:function(r){return msOf(r.RegCreatedUtc);}, cell:function(r){return '<td class="mono" title="TaskCache created time">'+esc(r.RegCreatedUtc)+'</td>';}},
+  {h:"Last run (UTC)", sk:function(r){return msOf(r.RegLastStartUtc);}, cell:function(r){return '<td class="mono">'+esc(r.RegLastStartUtc)+'</td>';}},
+  {h:"RegDate (host-local)", sk:function(r){return String(r.RegDate);}, cell:function(r){return '<td class="mono muted" title="RegistrationInfo/Date as written in the XML - host-local unless it carries Z / an offset; usually absent">'+esc(r.RegDate)+'</td>';}}
+];
+function renderTime(){
+  if(!ROWS.length) return;
+  var rows=filteredPf();
+  renderPfAgg(rows);
+  updateCatCounts();
+  var sk=TCOLS[TSORTKEY].sk, dir=TSORTDIR;
+  rows=rows.slice(0);
+  rows.sort(function(a,b){ var x=sk(a),y=sk(b);
+    if(typeof x==="number"&&typeof y==="number") return (x-y)*dir;
+    x=String(x); y=String(y); return x<y?-dir:(x>y?dir:0); });
+  var shown=rows.length>MAXROWS?MAXROWS:rows.length;
+  var html="<thead><tr>";
+  for(var c=0;c<TCOLS.length;c++){
+    var arrow=(TSORTKEY===c)?(TSORTDIR>0?" &#9650;":" &#9660;"):"";
+    html+='<th data-k="'+c+'">'+esc(TCOLS[c].h)+arrow+'</th>';
+  }
+  html+="</tr></thead><tbody>";
+  for(var i=0;i<shown;i++){
+    var r=rows[i];
+    html+='<tr data-i="'+i+'"'+(r.sus?' class="sus"':'')+' style="cursor:pointer">';
+    for(var k=0;k<TCOLS.length;k++){ html+=TCOLS[k].cell(r); }
+    html+="</tr>";
+  }
+  html+="</tbody>";
+  $("tbl").innerHTML=html;
+  $("count").innerHTML=nf(rows.length)+" tasks"+(shown<rows.length?(" (showing "+nf(shown)+")"):"")+maxRowsWarn(shown,rows.length);
+  var ths=$("tbl").getElementsByTagName("th");
+  for(var j=0;j<ths.length;j++){ ths[j].onclick=function(e){
+    e=e||window.event; var t=e.target||e.srcElement;
+    if(t && /\bcgrip\b/.test(t.className+"")) return;   // resize-grip interactions must not sort
+    var kk=parseInt(this.getAttribute("data-k"),10);
+    if(TSORTKEY===kk) TSORTDIR*=-1; else { TSORTKEY=kk; TSORTDIR=1; }
+    renderTime();
+  }; }
+  setupColResize();
+  applyFreeze();
+  window.__viewRows=rows;
+}
+
+/* ---------- folders view (grouped per task folder; click drills into the Tasks view) ---------- */
+var CCOLS=[
+  {h:"Folder", sk:function(g){return g.folderL;}},
+  {h:"Tasks", sk:function(g){return g.n;}},
+  {h:"Enabled", sk:function(g){return g.enabled;}},
+  {h:"Non-Microsoft", sk:function(g){return g.nonMs;}},
+  {h:"Flagged", sk:function(g){return g.sus;}},
+  {h:"Max score", sk:function(g){return g.maxScore;}},
+  {h:"Newest change (UTC)", sk:function(g){return g.maxMs;}}
+];
+function buildFolderGroups(rows){
+  var map={}, out=[], i;
+  for(i=0;i<rows.length;i++){ var r=rows[i], k=r.folder, g=map[k];
+    if(!g){ g=map[k]={folder:k, folderL:k.toLowerCase(), n:0, enabled:0, nonMs:0, sus:0, maxScore:0, maxMs:0, newest:""}; out.push(g); }
+    g.n++; if(r.Enabled!=="false" && r.ParseStatus!=="no-xml") g.enabled++; if(!r.inMs) g.nonMs++;
+    if(r.sus) g.sus++; if(r.score>g.maxScore) g.maxScore=r.score;
+    if(r.ms>g.maxMs){ g.maxMs=r.ms; g.newest=r.ChangedUtc; } }
+  return out;
+}
+function renderFolders(){
+  if(!ROWS.length) return;
+  var rows=filteredPf();
+  renderPfAgg(rows);
+  updateCatCounts();
+  var groups=buildFolderGroups(rows);
+  var sk=CCOLS[CSORTKEY].sk, dir=CSORTDIR;
+  groups.sort(function(a,b){ var x=sk(a),y=sk(b);
+    if(typeof x==="number"&&typeof y==="number"){ if(x!==y) return (x-y)*dir; return b.maxScore-a.maxScore || (a.folderL<b.folderL?-1:1); }
+    x=String(x); y=String(y); return x<y?-dir:(x>y?dir:0); });
+  var html="<thead><tr>";
+  for(var c=0;c<CCOLS.length;c++){
+    var arrow=(CSORTKEY===c)?(CSORTDIR>0?" &#9650;":" &#9660;"):"";
+    html+='<th data-k="'+c+'">'+esc(CCOLS[c].h)+arrow+'</th>';
+  }
+  html+="</tr></thead><tbody>";
+  for(var i=0;i<groups.length;i++){
+    var g=groups[i], df=' data-folder="'+esc(g.folder)+'"';
+    html+='<tr'+(g.sus?' class="sus"':'')+' style="cursor:pointer" title="Click to show this folder\'s tasks">';
+    html+='<td class="first mono"'+df+'>'+esc(g.folder)+'</td>';
+    html+='<td class="mono"'+df+' style="text-align:right">'+esc(nf(g.n))+'</td>';
+    html+='<td class="mono"'+df+' style="text-align:right">'+esc(nf(g.enabled))+'</td>';
+    html+='<td class="mono"'+df+' style="text-align:right">'+esc(nf(g.nonMs))+'</td>';
+    html+='<td class="mono"'+df+' style="text-align:right'+(g.sus?';color:#ff6b6b':'')+'">'+esc(nf(g.sus))+'</td>';
+    html+='<td class="mono"'+df+' style="text-align:right">'+esc(g.maxScore)+'</td>';
+    html+='<td class="mono"'+df+'>'+esc(g.newest)+'</td>';
+    html+="</tr>";
+  }
+  html+="</tbody>";
+  $("tbl").innerHTML=html;
+  $("count").innerHTML=nf(groups.length)+" folders ("+nf(rows.length)+" tasks)";
+  var ths=$("tbl").getElementsByTagName("th");
+  for(var j=0;j<ths.length;j++){ ths[j].onclick=function(e){
+    e=e||window.event; var t=e.target||e.srcElement;
+    if(t && /\bcgrip\b/.test(t.className+"")) return;   // resize-grip interactions must not sort
+    var kk=parseInt(this.getAttribute("data-k"),10);
+    if(CSORTKEY===kk) CSORTDIR*=-1; else { CSORTKEY=kk; CSORTDIR=(kk===0?1:-1); }
+    renderFolders();
+  }; }
+  setupColResize();
+  applyFreeze();
+  window.__viewRows=groups;
+}
+
+/* ---------- detail pane ---------- */
+function hlClassFor(entryL){
+  for(var t=0;t<IOCS.length;t++){ if(entryL.indexOf(IOCS[t])>=0) return "hl-ioc"; }
+  if(isUserPath(entryL)) return "hl-user";
+  return "";
+}
+function detRow(label,val,mono){
+  if(val==null||String(val)==="") return "";
+  var vL=String(val).toLowerCase(), cls=hlClassFor(vL);
+  return '<div style="margin:2px 0"><span class="muted" style="display:inline-block;width:150px;vertical-align:top;font-size:11px">'+esc(label)+'</span>'
+    +'<span class="'+(mono?"mono ":"")+(cls||"")+'" style="font-size:12px;word-wrap:break-word">'+esc(val)+'</span></div>';
+}
+function reEsc(s){ return String(s).replace(/[\\^$.*+?()[\]{}|\/]/g,"\\$&"); }
+function xmlHtml(text){   // evidence is attacker-authored: escape FIRST, then wrap IOC hits in our own markup only
+  var h=esc(text);
+  for(var i=0;i<IOCS.length;i++){ var et=esc(IOCS[i]); if(!et) continue;
+    try{ h=h.replace(new RegExp(reEsc(et),"gi"), function(m){ return '<span class="hl-ioc">'+m+'</span>'; }); }catch(e){} }
+  return h;
+}
+function renderDetail(rec){
+  DETREC=rec;
+  var i, h='<div class="mono" style="font-size:14px;margin-bottom:6px"><b>'+esc(rec.TaskPath)+'</b></div>';
+  h+='<div style="margin-bottom:6px">'+tagHtml(rec)+'</div>';
+  if(rec.reasons.length){ h+='<div style="font-size:12px;color:#ff9b9b;margin-bottom:6px">';
+    for(i=0;i<rec.reasons.length;i++) h+="&bull; "+esc(rec.reasons[i])+"<br>"; h+='</div>'; }
+  h+='<div style="word-wrap:break-word">';
+  h+='<div class="dsec">Actions'+(rec.ParseStatus==="no-xml"?" (decoded from the TaskCache registry copy)":"")+'</div>';
+  var acts=String(rec.AllActions||"").split(" || ");
+  for(i=0;i<acts.length;i++) h+=detRow("Action "+(i+1), acts[i], true);
+  if(rec.RegActions && rec.ParseStatus!=="no-xml"){
+    var same=normAct(rec.RegActions)===normAct(rec.AllActions);
+    h+=detRow("TaskCache copy", same?"(identical to the XML)":rec.RegActions, true); }
+  h+='<div class="dsec">Triggers</div>';
+  var trs=String(rec.TriggerSummary||"").split("; ");
+  for(i=0;i<trs.length;i++) h+=detRow("Trigger "+(i+1), trs[i], true);
+  h+=detRow("Earliest start", rec.StartBoundary, true)+detRow("Its end", rec.EndBoundary, true)+detRow("Shortest repeat", rec.MinRepetition, true);
+  h+='<div class="dsec">Principal &amp; settings</div>';
+  h+=detRow("Run as", rec.RunAs, true)+detRow("Logon type", rec.LogonType, true)+detRow("Run level", rec.RunLevel, true);
+  h+=detRow("Enabled", rec.Enabled, true)+detRow("Hidden", rec.Hidden, true)+detRow("Delete after expiry", rec.DeleteExpired, true);
+  h+='<div class="dsec">Registration</div>';
+  h+=detRow("Author", rec.Author, true)+detRow("Description", rec.Description, false)+detRow("Source", rec.Source, true);
+  h+=detRow("URI", rec.Uri, true)+detRow("RegDate (host-local)", rec.RegDate, true)+detRow("Task schema", rec.XmlVersion, true)+detRow("Security descriptor", rec.SecurityDescriptor, true);
+  if(rec.RegStatus){
+    h+='<div class="dsec">TaskCache (SOFTWARE hive)</div>';
+    h+=detRow("Status", rec.RegStatus, true)+detRow("Task GUID", rec.RegGuid, true)+detRow("Created (UTC)", rec.RegCreatedUtc, true);
+    h+=detRow("Last start (UTC)", rec.RegLastStartUtc, true)+detRow("Last stop (UTC)", rec.RegLastStopUtc, true)+detRow("Last result", rec.RegLastResult, true);
+    h+=detRow("Task state", rec.RegTaskState, true)+detRow("Tree key LastWrite", rec.TreeLastWriteUtc, true)+detRow("Tree Index", rec.TreeIndex, true)+detRow("Tree SD present", rec.TreeSD, true); }
+  h+='<div class="dsec">Times &amp; files</div>';
+  h+=detRow("Changed (UTC)", rec.ChangedUtc+(rec.ChangedSource?("  ["+rec.ChangedSource+"]"):""), true);
+  h+=detRow("File created (UTC)", rec.FileCreatedUtc, true)+detRow("File modified (UTC)", rec.FileModifiedUtc+(rec.FileTimeSource?("  ["+rec.FileTimeSource+"]"):""), true);
+  if(rec.ExtractedModifiedUtc && rec.ExtractedModifiedUtc!==rec.FileModifiedUtc) h+=detRow("As extracted", rec.ExtractedModifiedUtc, true);
+  h+=detRow("Parse status", rec.ParseStatus, true)+detRow("File size", rec.FileSize?(nf(rec.FileSize)+" bytes"):"", true);
+  h+=detRow("Tasks root", rec.TasksRoot, true)+detRow("Source file", rec.SourceFile, true);
+  h+='</div>';
+  var x=XMLTEXT[String(rec.SourceFile).toLowerCase()];
+  if(x) h+='<div class="dsec">Raw task XML</div><div class="xml">'+xmlHtml(x)+'</div>';
+  else if(rec.ParseStatus!=="no-xml") h+='<div class="muted" style="font-size:11px;margin-top:6px">Raw XML is kept in memory only for tasks parsed in this session - re-run the input to view it here.</div>';
+  $("detBody").innerHTML=h;
+  showEl("detailCard",true);
+}
+function closeDetail(){ DETREC=null; showEl("detailCard",false); $("detBody").innerHTML=""; }
+function copyDetail(){
+  if(!DETREC){ setStatus("No record open","err"); return; }
+  var r=DETREC, out=[], i;
+  out.push(r.TaskPath+"   ["+(r.RegStatus||"no TaskCache data")+"]");
+  out.push("tags: "+(r.tags.length?r.tags.join(", "):"none")+"  score "+r.score);
+  for(i=0;i<r.reasons.length;i++) out.push("  - "+r.reasons[i]);
+  out.push("run as "+(r.RunAs||"?")+(r.LogonType?(" / "+r.LogonType):"")+(r.RunLevel?(" / "+r.RunLevel):"")+"   author "+(r.Author||"?"));
+  out.push("actions: "+r.AllActions);
+  if(r.RegActions && normAct(r.RegActions)!==normAct(r.AllActions)) out.push("TaskCache actions: "+r.RegActions);
+  out.push("triggers: "+r.TriggerSummary);
+  out.push("changed "+r.ChangedUtc+" UTC ("+(r.ChangedSource||"?")+")"+(r.RegCreatedUtc?("   registered "+r.RegCreatedUtc+" UTC"):"")+(r.RegLastStartUtc?("   last run "+r.RegLastStartUtc+" UTC"):""));
+  out.push("source: "+r.SourceFile);
+  try{ window.clipboardData.setData("Text", out.join("\r\n")); setStatus("Record copied to clipboard","ok"); }
+  catch(e){ setStatus("Copy failed: "+e.message,"err"); }
+}
+
+/* ---------- generic grid (non-SchedTasks CSVs) ---------- */
+function isNumStr(s){ s=trimStr(String(s)); return s!=="" && /^-?\d+(\.\d+)?$/.test(s); }
+function ingestGeneric(raw, head, srcLabel){
+  setMode("generic");
+  GHEAD=head; GROWS=[];
+  for(var i=1;i<raw.length;i++){ var rw=raw[i]; if(rw.length>=1 && !(rw.length===1 && rw[0]==="")) GROWS.push(rw); }
+  GSRC=srcLabel;
+  GSRCIDX=-1; for(var c=0;c<head.length;c++){ if(/^SourceFile(name)?$/i.test(trimStr(head[c]))){ GSRCIDX=c; break; } }
+  if(GSRCIDX>=0){ var sv=[]; for(var s=0;s<GROWS.length;s++) sv.push(GSRCIDX<GROWS[s].length?GROWS[s][GSRCIDX]:""); populateSourceFilter(distinctVals(sv)); }
+  else populateSourceFilter([]);
+  $("results").className="";
+  $("srcpill").innerHTML=nf(GROWS.length)+" rows &middot; "+esc(srcLabel)+" ("+GHEAD.length+" cols)";
+  QUERY=""; $("q").value=""; GSORTKEY=-1;
+  closeDetail();
+  setStatus("Loaded "+nf(GROWS.length)+" rows (generic table view)","ok");
+  renderGeneric();
+}
+function renderGeneric(){
+  if(!GHEAD) return;
+  var q=QUERY, rows=[];
+  for(var i=0;i<GROWS.length;i++){ var rw=GROWS[i];
+    if(SRCFILTER && GSRCIDX>=0 && (GSRCIDX<rw.length?rw[GSRCIDX]:"")!==SRCFILTER) continue;
+    if(q){ if(rw.join("  ").toLowerCase().indexOf(q)<0) continue; }
+    rows.push(rw);
+  }
+  if(GSORTKEY>=0){ var k=GSORTKEY, dir=GSORTDIR; rows=rows.slice(0);
+    rows.sort(function(a,b){ var x=(k<a.length?a[k]:""), y=(k<b.length?b[k]:"");
+      if(isNumStr(x)&&isNumStr(y)) return (parseFloat(x)-parseFloat(y))*dir;
+      x=String(x).toLowerCase(); y=String(y).toLowerCase(); return x<y?-dir:(x>y?dir:0); });
+  }
+  $("statbar").innerHTML=stat(nf(GROWS.length),"rows")+stat(nf(GHEAD.length),"columns")+stat(nf(rows.length),"matching")+
+    '<span class="stat" style="min-width:240px"><span class="n" style="font-size:12px">'+esc(GSRC)+'</span><span class="l">source</span></span>';
+  var shown=rows.length>MAXROWS?MAXROWS:rows.length;
+  var h="<thead><tr>";
+  for(var c=0;c<GHEAD.length;c++){ var ar=(GSORTKEY===c)?(GSORTDIR>0?" ▲":" ▼"):""; h+='<th data-k="'+c+'">'+esc(GHEAD[c])+ar+'</th>'; }
+  h+="</tr></thead><tbody>";
+  for(var r=0;r<shown;r++){ var row=rows[r]; h+="<tr>";
+    for(var c2=0;c2<GHEAD.length;c2++){ var v=(c2<row.length?row[c2]:""); h+='<td class="mono" title="'+esc(v)+'">'+esc(v)+'</td>'; }
+    h+="</tr>"; }
+  h+="</tbody>"; $("tbl").innerHTML=h;
+  $("count").innerHTML=nf(rows.length)+" rows"+(shown<rows.length?(" (showing "+nf(shown)+")"):"")+maxRowsWarn(shown,rows.length);
+  var ths=$("tbl").getElementsByTagName("th");
+  for(var i2=0;i2<ths.length;i2++){ ths[i2].onclick=function(e){
+    e=e||window.event; var t=e.target||e.srcElement;
+    if(t && /\bcgrip\b/.test(t.className+"")) return;   // resize-grip interactions must not sort
+    var kk=parseInt(this.getAttribute("data-k"),10);
+    if(GSORTKEY===kk) GSORTDIR*=-1; else { GSORTKEY=kk; GSORTDIR=1; } renderGeneric(); }; }
+  setupColResize();
+  applyFreeze();
+  window.__viewRows=rows;
+}
+function setMode(m){
+  MODE=m; var pf=(m==="tasks");
+  showEl("pfCards",pf); showEl("pfCats",pf); showEl("pfDateCtl",pf); showEl("pfFoot",pf);
+  showEl("iocBtn",pf); showEl("viewToggle",pf);
+  if(!pf){ showEl("iocWrap",false); closeDetail(); showEl("userWrap",false); showEl("tagWrap",false); showEl("rootWrap",false); showEl("folderChip",false); showEl("skewWarn",false); }
+  if(pf) showEl("srcWrap",false);
+  $("ovTitle").innerHTML = pf ? "Overview &mdash; reflects active filters" : "Overview";
+  $("tableTitle").innerHTML = pf ? viewTitle(VIEW) : "Records";
+}
+
+/* ---------- export / copy ---------- */
+function cq(v){ v=(v==null)?"":String(v); return /[",\r\n]/.test(v)?('"'+v.replace(/"/g,'""')+'"'):v; }
+function nowStamp(){ var d=new Date(); function p(x){return (x<10?"0":"")+x;}
+  return d.getFullYear()+""+p(d.getMonth()+1)+p(d.getDate())+"_"+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds()); }
+function exportView(){
+  if(MODE==="generic"){ exportGeneric(); return; }
+  if(VIEW==="folders"){ exportFolders(); return; }
+  var rows=window.__viewRows||[];
+  if(!rows.length){ setStatus("Nothing to export","err"); return; }
+  var head=["Score","Tags","Flagged","User"].concat(CSVCOLS), lines=[head.join(",")], i, j;
+  for(i=0;i<rows.length;i++){ var r=rows[i], cells=[cq(r.score),cq(r.tags.join("; ")),cq(r.sus?"Yes":"No"),cq(r.user)];
+    for(j=0;j<CSVCOLS.length;j++) cells.push(cq(r[CSVCOLS[j]]));
+    lines.push(cells.join(",")); }
+  var dir=LASTOUTDIR||$("outDir").value;
+  var path=dir+"\\"+((VIEW==="time")?"timeline_export_":"filtered_export_")+nowStamp()+".csv";
+  try{ writeUtf8(path, lines.join("\r\n")); setStatus("Exported "+nf(rows.length)+" rows -> "+path,"ok"); appendLog("Exported: "+path); }
+  catch(e){ setStatus("Export failed: "+e.message,"err"); }
+}
+function exportFolders(){
+  var groups=window.__viewRows||[];
+  if(!groups.length){ setStatus("Nothing to export","err"); return; }
+  var lines=["Folder,Tasks,Enabled,NonMicrosoft,Flagged,MaxScore,NewestChange_UTC"];
+  for(var i=0;i<groups.length;i++){ var g=groups[i];
+    lines.push([cq(g.folder),cq(g.n),cq(g.enabled),cq(g.nonMs),cq(g.sus),cq(g.maxScore),cq(g.newest)].join(",")); }
+  var dir=LASTOUTDIR||$("outDir").value;
+  var path=dir+"\\folders_export_"+nowStamp()+".csv";
+  try{ writeUtf8(path, lines.join("\r\n")); setStatus("Exported "+nf(groups.length)+" folders -> "+path,"ok"); appendLog("Exported: "+path); }
+  catch(e){ setStatus("Export failed: "+e.message,"err"); }
+}
+function exportGeneric(){
+  var rows=window.__viewRows||[];
+  if(!GHEAD||!rows.length){ setStatus("Nothing to export","err"); return; }
+  var lines=[]; var hd=[]; for(var c=0;c<GHEAD.length;c++) hd.push(cq(GHEAD[c])); lines.push(hd.join(","));
+  for(var i=0;i<rows.length;i++){ var rw=rows[i]; var cells=[]; for(var c2=0;c2<GHEAD.length;c2++) cells.push(cq(c2<rw.length?rw[c2]:"")); lines.push(cells.join(",")); }
+  var dir=LASTOUTDIR||$("outDir").value;
+  var path=dir+"\\filtered_export_"+nowStamp()+".csv";
+  try{ writeUtf8(path, lines.join("\r\n")); setStatus("Exported "+nf(rows.length)+" rows -> "+path,"ok"); appendLog("Exported: "+path); }
+  catch(e){ setStatus("Export failed: "+e.message,"err"); }
+}
+function copyNotes(){
+  if(MODE==="generic"){
+    var grows=(window.__viewRows||[]).slice(0,500); if(!GHEAD||!grows.length){ setStatus("Nothing to copy","err"); return; }
+    var gout=[GHEAD.join("\t")];
+    for(var g=0;g<grows.length;g++) gout.push(grows[g].join("\t"));
+    try{ window.clipboardData.setData("Text", gout.join("\r\n")); setStatus("Copied "+grows.length+" rows (TSV)"+copyCapNote(window.__viewRows),"ok"); }
+    catch(eg){ setStatus("Copy failed: "+eg.message,"err"); }
+    return;
+  }
+  var rows=(window.__viewRows||[]).slice(0,500);
+  if(!rows.length){ setStatus("Nothing to copy","err"); return; }
+  var out=[], i;
+  if(VIEW==="folders"){
+    for(i=0;i<rows.length;i++){ var f=rows[i];
+      out.push(f.folder+" | tasks="+f.n+" | enabled="+f.enabled+" | non-MS="+f.nonMs+" | flagged="+f.sus+" | max score "+f.maxScore+" | newest "+f.newest); }
+  } else {
+    for(i=0;i<rows.length;i++){ var r=rows[i];
+      out.push((r.ChangedUtc||"(no time)")+" UTC | "+(r.tags.length?(r.score+" "+r.tags.join(",")):"0")+" | "+r.TaskPath+" | "+(r.RunAs||"(unknown)")+" | "+actionText(r)
+        +(r.RegStatus && r.RegStatus!=="matched"?(" | TaskCache: "+r.RegStatus):"")); }
+  }
+  try{ window.clipboardData.setData("Text", out.join("\r\n")); setStatus("Copied "+out.length+" rows to clipboard"+copyCapNote(window.__viewRows),"ok"); }
+  catch(e){ setStatus("Copy failed: "+e.message,"err"); }
+}
+
+/* ---------- IOC list ---------- */
+function applyIocs(){
+  var t=$("iocBox").value, parts=String(t).split(/[\r\n,;]+/), out=[];
+  for(var i=0;i<parts.length;i++){ var s=trimStr(parts[i]).toLowerCase(); if(s) out.push(s); }
+  IOCS=out;
+  $("iocInfo").innerHTML=IOCS.length?(nf(IOCS.length)+" term(s) active"):"no terms";
+  if(MODE==="tasks"&&ROWS.length){ rescoreAll(); populateTagSel(); render(); if(DETREC) renderDetail(DETREC); }
+  setStatus(IOCS.length?("IOC list applied - "+IOCS.length+" term(s), tasks rescored"):"IOC list cleared","ok");
+}
+
+/* ---------- wiring ---------- */
+function init(){
+  try{ window.resizeTo(1380,920); }catch(e){}
+  $("apppill").innerHTML="app v"+APP_VERSION; $("apppill").title="This app v"+APP_VERSION+" - checking GitHub for a newer release...";
+  try{ document.title="SchedTasks Analyzer v"+APP_VERSION; }catch(e){}
+  $("tblScroll").onscroll=applyFreeze;
+  loadSettings();
+  // default input is EMPTY: the live Tasks folder needs elevation and its hive is locked - point the app
+  // at a collected host / collection folder (or use "This machine" deliberately)
+  $("hostName").onkeyup=function(){ HOST_TOUCHED=true; syncOutDir(); };
+  $("outDir").onkeyup=function(){ OUT_TOUCHED=true; };
+  $("pfPath").onchange=function(){ hostGuessFrom(this.value); };
+  loadToolkitIoc();   // shared toolkit IOC.txt - merged before any CLI /auto run
+  var zoom=0.9;
+  var zContent=$("content");
+  /* A+ / A- text scaling. <header> and the modal cards live OUTSIDE #content, so zooming #content
+     alone left the app's top row - and the Help dialog - at a fixed size while everything else grew
+     or shrank. Each block is zoomed and then widened by 1/zoom, because a zoom<1 shrinks a 100%-wide
+     block to less than the viewport and leaves a blank gutter down the right edge. For the modals the
+     CARD is scaled and not the fixed overlay, so the dim backdrop still covers the whole viewport at
+     any zoom level. (Ported from vSphere Support Bundle Analyzer.) */
+  function zoomBlock(el){ if(!el) return; el.style.zoom=zoom; el.style.width=(100/zoom)+"%"; el.style.boxSizing="border-box"; }
+  var ZOOM_MODALS=["helpModal"];
+  function applyZoom(){
+    zoomBlock(zContent);
+    var hs=document.getElementsByTagName("header"); if(hs.length) zoomBlock(hs[0]);
+    for(var mi=0;mi<ZOOM_MODALS.length;mi++){ var m=$(ZOOM_MODALS[mi]); if(!m) continue;
+      var cards=m.getElementsByTagName("div");
+      for(var ci=0;ci<cards.length;ci++){ if(/(^|\s)mcard(\s|$)/.test(cards[ci].className+"")){ cards[ci].style.zoom=zoom; break; } } }
+    var p=Math.round(zoom*100)+"%";
+    $("fup").title="Larger text ("+p+")"; $("fdown").title="Smaller text ("+p+")"; }
+  applyZoom();
+  /* re-assert the zoom-compensated widths on resize/maximise, so full-screening reflows to fill;
+     the header needs it too now that it is zoomed alongside #content. */
+  try{ window.onresize=function(){ try{ zContent.style.width=(100/zoom)+"%";
+    var hr=document.getElementsByTagName("header"); if(hr.length) hr[0].style.width=(100/zoom)+"%"; }catch(er){} }; }catch(eR){}
+  $("fup").onclick=function(){ zoom=Math.min(zoom+0.15,2.5); applyZoom(); };
+  $("fdown").onclick=function(){ zoom=Math.max(zoom-0.15,0.6); applyZoom(); };
+
+  $("verBtn").onclick=function(){ resolveExe(); checkVersion(false); };
+  $("updBtn").onclick=function(){ downloadLatest(false); };
+  $("openDirBtn").onclick=openDir;
+  $("procBtn").onclick=function(){ processTasks(); };
+  $("loadSelBtn").onclick=function(){ var v=$("producedSel").value; if(!v) return;
+    setStatus("Loading "+v,"muted"); window.setTimeout(function(){ loadCsvFile(v); },50); };
+  $("browseBtn").onclick=function(){
+    try{
+      var sha=new ActiveXObject("Shell.Application");
+      var fld=sha.BrowseForFolder(0,"Select a host / collection folder (every Windows\\System32\\Tasks below it is found) or a Tasks folder.",0x51);
+      if(fld){ var p=""; try{ p=fld.Self.Path+""; }catch(e2){}
+        if(/^[a-z]:\\|^\\\\/i.test(p)){ $("pfPath").value=p; hostGuessFrom(p); }
+        else if(p) setStatus("That selection has no filesystem path - pick a real folder.","err"); }
+    }catch(e){ $("pfPick").click(); }
+  };
+  $("browseFileBtn").onclick=function(){ $("pfPick").click(); };
+  $("pfPick").onchange=function(){ if(this.value){ $("pfPath").value=this.value; hostGuessFrom(this.value); } };
+  $("liveBtn").onclick=function(){
+    try{ var sh=new ActiveXObject("WScript.Shell"), win=sh.ExpandEnvironmentStrings("%WINDIR%")+"", w64=sh.ExpandEnvironmentStrings("%PROCESSOR_ARCHITEW6432%")+"";
+      var p=win+((w64 && w64.indexOf("%")<0)?"\\Sysnative\\Tasks":"\\System32\\Tasks");   // a 32-bit mshta on x64 would be redirected to the empty SysWOW64\Tasks
+      $("pfPath").value=p; hostGuessFrom(p);
+      setStatus("This machine's Tasks folder selected - reading it needs an elevated (Run as administrator) mshta; the live SOFTWARE hive is locked, so the TaskCache cross-check is skipped.","muted");
+    }catch(e){ setStatus("Could not resolve the Windows folder: "+e.message,"err"); } };
+  $("loadBtn").onclick=function(){ $("csvPick").click(); };
+  $("csvPick").onchange=function(){ if(this.value){ setStatus("Loading "+this.value,"muted"); loadCsvFile(this.value); } };
+  $("logToggle").onclick=function(){ var l=$("log");
+    if(l.style.display==="none"||!l.style.display){
+      if(!trimStr(l.innerHTML.replace(/<[^>]*>/g,""))){ l.innerHTML='<span class="muted">(empty - run details appear here. While staging / RECmd runs, a console window shows progress.)</span>'; l.setAttribute("data-ph","1"); }
+      l.style.display="block"; this.innerHTML="Hide log";
+    } else { l.style.display="none"; this.innerHTML="Show log"; } };
+
+  var catBtns=$("pfCats").getElementsByTagName("button");
+  for(var i=0;i<catBtns.length;i++){ if(catBtns[i].getAttribute("data-cat")){ catBtns[i].onclick=function(){
+    CURCAT=this.getAttribute("data-cat"); highlightCat(); render();
+  }; } }
+
+  $("q").onkeyup=function(){ if(qTimer) window.clearTimeout(qTimer);
+    qTimer=window.setTimeout(function(){ QUERY=trimStr($("q").value).toLowerCase(); render(); },150); };
+  $("dfrom").onchange=function(){ DFROM=dayNum(this.value); render(); };
+  $("dto").onchange=function(){ DTO=dayNum(this.value); render(); };
+  $("srcSel").onchange=function(){ SRCFILTER=this.value; render(); };
+  $("userSel").onchange=function(){ USERFILTER=this.value; render(); };
+  $("tagSel").onchange=function(){ TAGFILTER=this.value; render(); };
+  $("rootSel").onchange=function(){ ROOTFILTER=this.value; render(); };
+  $("clearBtn").onclick=function(){ $("q").value="";$("dfrom").value="";$("dto").value="";$("srcSel").value="";
+    QUERY="";DFROM=0;DTO=0;SRCFILTER="";CURCAT="all"; USERFILTER=""; TAGFILTER=""; ROOTFILTER=""; FOLDERFILTER="";
+    try{ $("userSel").value=""; $("tagSel").value=""; $("rootSel").value=""; }catch(ec){}
+    highlightCat(); updateFolderChip(); render(); };
+  $("exportBtn").onclick=exportView;
+  $("copyBtn").onclick=copyNotes;
+
+  $("vTasks").onclick=function(){ setView("tasks"); };
+  $("vTime").onclick=function(){ setView("time"); };
+  $("vFolders").onclick=function(){ setView("folders"); };
+  $("iocBtn").onclick=function(){ var w=$("iocWrap"); showEl("iocWrap", /\bhide\b/.test(w.className)); };
+  $("iocApply").onclick=applyIocs;
+  $("iocLoad").onclick=function(){ $("iocPick").click(); };
+  $("iocPick").onchange=function(){ if(this.value){
+    try{ $("iocBox").value=readUtf8(this.value); applyIocs(); }
+    catch(e){ setStatus("Could not read IOC file: "+e.message,"err"); } } };
+  $("detClose").onclick=closeDetail;
+  $("detCopy").onclick=copyDetail;
+
+  /* click delegation: data-user -> sticky run-as filter; data-folder -> folder filter (drills into Tasks);
+     data-clearfolder -> drop it; data-q -> search; table row -> detail pane */
+  document.onclick=function(e){ e=e||window.event; var t=e.target||e.srcElement;
+    if(t && /\bcgrip\b/.test((t.className||"")+"")) return;   // column-resize grips never act as row/link clicks
+    var ga=function(a){ return (t&&t.getAttribute)?t.getAttribute(a):null; };
+    var du=ga("data-user");
+    if(du!=null&&du!==""){ USERFILTER=du; try{ $("userSel").value=du; }catch(eu){} render(); return; }
+    var dfo=ga("data-folder");
+    if(dfo!=null&&dfo!==""){ FOLDERFILTER=dfo; updateFolderChip(); setView("tasks", true); render(); return; }
+    if(ga("data-clearfolder")){ FOLDERFILTER=""; updateFolderChip(); render(); return; }
+    var q=ga("data-q");
+    if(q){ $("q").value=q; QUERY=q.toLowerCase(); render(); return; }
+    if(MODE!=="tasks" || VIEW==="folders") return;
+    var n=t;
+    while(n && n.tagName!=="TR"){ n=n.parentNode; if(n&&n.tagName==="TABLE") { n=null; break; } }
+    if(n && n.getAttribute && n.getAttribute("data-i")!=null && n.getAttribute("data-i")!==""){
+      var ix=parseInt(n.getAttribute("data-i"),10);
+      var rows=window.__viewRows||[];
+      if(ix>=0&&ix<rows.length){
+        renderDetail(rows[ix]);
+        var trs=$("tbl").getElementsByTagName("tr");
+        for(var z=0;z<trs.length;z++){ if(trs[z].getAttribute("data-i")!=null){
+          var zi=parseInt(trs[z].getAttribute("data-i"),10), zr=rows[zi];
+          trs[z].className = (zi===ix) ? (((zr&&zr.sus)?"sus ":"")+"sel") : ((zr&&zr.sus)?"sus":""); } }
+      }
+    }
+  };
+
+  var __cli=parseCli(); try{ applyCli(__cli); }catch(eC){ appendLog("CLI parse error: "+eC.message); }
+  evaluateTooling();
+  if(isNetworkPath(htaFolder()))
+    appendLog("Heads-up: this app is running from a network location ("+htaFolder()+"). Windows zone policy may block the UTF-8 file reader there; the app falls back to ANSI IO automatically (UTF-16 task files are unaffected), but for full fidelity copy the folder to a local path.");
+}
+function isNetworkPath(p){
+  try{ if(/^\\\\/.test(p)) return true;
+    var fso=new ActiveXObject("Scripting.FileSystemObject");
+    return fso.GetDrive(fso.GetDriveName(p)).DriveType===3;   // 3 = Remote
+  }catch(e){ return false; }
+}
+function dayNum(s){ if(!s) return 0; var m=String(s).match(/(\d{4})-(\d{1,2})-(\d{1,2})/); if(!m) return 0;
+  function p(x){ x=String(x); return x.length<2?("0"+x):x; }
+  return Number(m[1]+p(m[2])+p(m[3])); }
+
+/* ---------- help / about overlay ---------- */
+var GITHUB="https://github.com/bpmorris22/SchedTasks-Analyzer";
+function openUrl(u){ try{ new ActiveXObject("WScript.Shell").Run('"'+u+'"',1,false); }catch(e){ setStatus("Could not open browser: "+e.message,"err"); } }
+function openHelp(){ try{ $("helpVer").innerHTML="v"+APP_VERSION; }catch(e){} showEl("helpModal",true); }
+function closeHelp(){ showEl("helpModal",false); }
+
+var MANUAL_URL="https://raw.githubusercontent.com/bpmorris22/SchedTasks-Analyzer/main/docs/SchedTasks-Analyzer-Manual.html";   // this app's own manual
+var MANUAL_FILE="SchedTasks-Analyzer-Manual.html";
+function openManualFile(path){ try{ new ActiveXObject("WScript.Shell").Run('explorer.exe "'+path+'"',1,false); return true; } catch(e){ setStatus("Downloaded the field guide, but could not open it: "+e.message,"err"); return false; } }
+function openInstructions(){ var fso=new ActiveXObject("Scripting.FileSystemObject"); var dest=fso.GetSpecialFolder(2)+"\\"+MANUAL_FILE; setStatus("Downloading the manual from GitHub…","muted"); var ps1=fso.GetSpecialFolder(2)+"\\man_"+uid()+".ps1"; var dq=String(dest).replace(/'/g,"''"); var L=[]; L.push("$ErrorActionPreference='Stop'"); L.push("[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12"); L.push("Invoke-WebRequest -UseBasicParsing -Uri '"+MANUAL_URL+"' -OutFile '"+dq+"' -Headers @{ 'User-Agent'='SchedTasks-Analyzer' }"); L.push("if((Get-Item '"+dq+"').Length -lt 2000){ throw 'downloaded file too small' }"); L.push("Write-Output 'MAN_OK'"); try{ var f=fso.CreateTextFile(ps1,true); f.Write(L.join("\r\n")); f.Close(); } catch(ew){ setStatus("Could not stage the field-guide download: "+ew.message,"err"); return; } var r=runBat(['powershell -NoProfile -ExecutionPolicy Bypass -File "'+ps1+'" > "__LOG__" 2>&1']); try{ fso.DeleteFile(ps1); }catch(e0){} if((r.log+"").indexOf("MAN_OK")>=0 && fileExists(dest)){ if(openManualFile(dest)) setStatus("Field guide downloaded and opened in your browser.","ok"); appendLog("Field guide: downloaded latest -> "+dest); } else { appendLog("--- field-guide download ---\n"+r.log); if(fileExists(dest)){ if(openManualFile(dest)) setStatus("Download failed (offline?) — opened the previously downloaded copy.","muted"); } else { setStatus("Field-guide download failed (offline, or the file moved). See log; or open it from the GitHub repo.","err"); } } }
+
+/* ---------- command-line invocation: "<inputOrCsv>" ["<outDir>"] [/auto] ----------
+   .csv → auto-load into the viewer; a host / Tasks folder or a task file → prefill input (+process if /auto).
+   Lets an external artifact-finder open the analyzer already pointed at a scheduled-task artifact. */
+/* HTA:APPLICATION.commandLine is UNDEFINED in IE=edge document mode (a known mshta quirk that silently
+   kills CLI args). Recover it from WMI: the newest mshta.exe process whose command line names this .hta. */
+function getCommandLine(){
+  try{ var cl=staHta.commandLine+""; if(cl && cl!=="undefined") return cl; }catch(e){}
+  try{
+    var lp=decodeURIComponent(location.pathname+"").replace(/^\//,"").replace(/\//g,"\\");
+    var fn=lp.substring(lp.lastIndexOf("\\")+1).toLowerCase(); if(!fn) return "";
+    var loc=new ActiveXObject("WbemScripting.SWbemLocator"), svc=loc.ConnectServer(".","root\\cimv2");
+    var q=svc.ExecQuery("SELECT CommandLine,CreationDate FROM Win32_Process WHERE Name='mshta.exe'");
+    var best="", bestDate="", en=new Enumerator(q);
+    for(; !en.atEnd(); en.moveNext()){ var pr=en.item(); var pcl=(pr.CommandLine==null?"":pr.CommandLine+"");
+      if(pcl.toLowerCase().indexOf(fn)<0) continue; var cd=(pr.CreationDate==null?"":pr.CreationDate+"");
+      if(!best || cd>bestDate){ best=pcl; bestDate=cd; } }
+    return best;
+  }catch(e2){}
+  return "";
+}
+function tokenizeCmdTail(){ var cl=getCommandLine(); if(!cl) return [];
+  var m=cl.match(/\.hta"?/i); var tail=m?cl.substring(m.index+m[0].length):cl;
+  var toks=[],i=0,n=tail.length,cur="",inq=false;
+  while(i<n){ var c=tail.charAt(i);
+    if(inq){ if(c==='"'){inq=false;} else cur+=c; i++; continue; }
+    if(c==='"'){ inq=true; i++; continue; }
+    if(c===' '||c==='\t'){ if(cur!==""){toks.push(cur);cur="";} i++; continue; }
+    cur+=c; i++; }
+  if(cur!=="") toks.push(cur); return toks; }
+/* ---------- case window (family, 2026-07-07) ----------
+   /from:/to: (UTC calendar dates) prefill this app's existing date filter before any /auto run,
+   and are recorded in runinfo.json. FILTER ONLY — the window never touches scoring (attackers
+   stage outside the known window; the operator can always widen the filter inside the tool). */
+var CASE_FROM="", CASE_TO="";
+function applyCaseWindow(from,to){
+  if(from){ if(/^\d{4}-\d{2}-\d{2}$/.test(from)){ CASE_FROM=from; try{ $("dfrom").value=from; DFROM=dayNum(from); }catch(e){} } else appendLog("CLI: ignoring invalid /from value '"+from+"'"); }
+  if(to){ if(/^\d{4}-\d{2}-\d{2}$/.test(to)){ CASE_TO=to; try{ $("dto").value=to; DTO=dayNum(to); }catch(e2){} } else appendLog("CLI: ignoring invalid /to value '"+to+"'"); }
+  if(CASE_FROM||CASE_TO) appendLog("CLI: case window "+(CASE_FROM||"…")+" .. "+(CASE_TO||"…")+" — prefilled the date filter (filter only, never scored)");
+}
+function parseCli(){ var toks=tokenizeCmdTail(), cli={input:"",outDir:"",auto:false,from:"",to:""};
+  for(var i=0;i<toks.length;i++){ var t=toks[i];
+    if(/^[\/\-]{1,2}auto$/i.test(t)){ cli.auto=true; continue; }
+    var fm=t.match(/^[\/\-]{1,2}from[:=](\d{4}-\d{2}-\d{2})$/i); if(fm){ cli.from=fm[1]; continue; }
+    var tm=t.match(/^[\/\-]{1,2}to[:=](\d{4}-\d{2}-\d{2})$/i); if(tm){ cli.to=tm[1]; continue; }
+    if(/^[\/\-]/.test(t)) continue;
+    if(!cli.input) cli.input=t; else if(!cli.outDir) cli.outDir=t; }
+  return cli; }
+function applyCli(cli){ if(!cli.input) return false;
+  var fso=new ActiveXObject("Scripting.FileSystemObject");
+  applyCaseWindow(cli.from, cli.to);   // case window (UTC): prefill the date filter BEFORE any /auto run - filter only, never scored
+  if(/\.csv$/i.test(cli.input) && fso.FileExists(cli.input)){ appendLog("CLI: loading CSV "+cli.input); window.setTimeout(function(){ loadCsvFile(cli.input); },60); return true; }
+  if(fso.FolderExists(cli.input) || fso.FileExists(cli.input)) $("pfPath").value=cli.input;
+  else { setStatus("CLI input not found: "+cli.input,"err"); appendLog("CLI input not found: "+cli.input); return false; }
+  if(cli.outDir){ $("outDir").value=cli.outDir; OUT_TOUCHED=true; hostGuessFrom(cli.outDir); }
+  else hostGuessFrom(cli.input);
+  if(cli.auto){ appendLog("CLI: /auto - processing "+cli.input); window.setTimeout(function(){ autoProcess(); },200); }
+  else setStatus("CLI: input prefilled - click 'Process -> analyze' to run.","muted");
+  return true; }
+
+/* ---------- self-update: quiet check of this app's GitHub Releases; one-click download of a newer .hta ---------- */
+var SELF_REPO="bpmorris22/SchedTasks-Analyzer", SELF_HTA="SchedTasks-Analyzer.hta", SELF_LATEST="", SELF_ASSET_URL="";
+function selfVerNewer(r,l){ var a=String(r).split("."),b=String(l).split("."),n=Math.max(a.length,b.length);
+  for(var i=0;i<n;i++){ var x=parseInt(a[i],10)||0,y=parseInt(b[i],10)||0; if(x!==y) return x>y; } return false; }
+function selfPath(){ try{ var p=decodeURIComponent(location.pathname+"").replace(/^\//,"").replace(/\//g,"\\");
+  if(/\.hta$/i.test(p) && fileExists(p)) return p; }catch(e){} return (htaFolder()||"")+"\\"+SELF_HTA; }
+function checkSelfUpdate(){
+  try{
+    var x=new ActiveXObject("MSXML2.XMLHTTP.6.0");
+    x.open("GET","https://api.github.com/repos/"+SELF_REPO+"/releases/latest",true);
+    try{ x.setRequestHeader("User-Agent",SELF_HTA); }catch(eh){}
+    x.onreadystatechange=function(){ if(x.readyState!==4) return;
+      try{ if(x.status!==200) return; var t=x.responseText+"";
+        var m=t.match(/"tag_name"\s*:\s*"v?([0-9.]+)"/i); if(!m) return;
+        var latest=m[1]; var ap=$("apppill"); if(!selfVerNewer(latest,APP_VERSION)){ if(ap){ ap.className="pill ok"; ap.title="Up to date — v"+APP_VERSION+" is the latest release."; } return; }
+        var url="", re=/"browser_download_url"\s*:\s*"([^"]+\.hta)"/ig, mm;
+        while((mm=re.exec(t))){ if(mm[1].toLowerCase().indexOf(SELF_HTA.toLowerCase())>=0){ url=mm[1]; break; } if(!url) url=mm[1]; }
+        if(!url) url="https://github.com/"+SELF_REPO+"/releases/download/v"+latest+"/"+SELF_HTA;
+        SELF_LATEST=latest; SELF_ASSET_URL=url;
+        if(ap){ ap.className="pill bad"; ap.innerHTML="app v"+APP_VERSION+" &middot; update v"+latest; ap.title="A newer version (v"+latest+") is on GitHub — click the Update button."; }
+        var b=$("selfUpd"); if(b){ b.innerHTML="Update to v"+latest; b.className="btn primary";
+          b.title="A newer "+SELF_HTA+" (v"+latest+") is on GitHub — click to download & replace this file"; }
+      }catch(e){} };
+    x.send();
+  }catch(e){}
+}
+function doSelfUpdate(){
+  if(!SELF_ASSET_URL){ setStatus("No update available (or offline).","muted"); return; }
+  var target=selfPath();
+  if(!target || !/\.hta$/i.test(target)){ setStatus("Can't locate this app's own file to update in place.","err"); return; }
+  if(!confirm("Download "+SELF_HTA+" v"+SELF_LATEST+" and replace this file?\n\n"+target+"\n\nAfter it downloads, close and reopen the app to run the new version.")) return;
+  setStatus("Downloading v"+SELF_LATEST+"…","muted");
+  var fso=new ActiveXObject("Scripting.FileSystemObject"), tmp=fso.GetSpecialFolder(2)+"";
+  var ps1=tmp+"\\selfupd_"+new Date().getTime()+Math.floor(Math.random()*100000)+".ps1";
+  var tq=String(target).replace(/'/g,"''"), uq=String(SELF_ASSET_URL).replace(/'/g,"''");
+  var L=["$ErrorActionPreference='Stop'","[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12",
+    "$u='"+uq+"'","$t='"+tq+"'","$tmp=Join-Path $env:TEMP ('selfupd_'+[guid]::NewGuid().ToString('N')+'.hta')",
+    "Invoke-WebRequest -Uri $u -OutFile $tmp -Headers @{ 'User-Agent'='"+SELF_HTA+"' }",
+    "if((Get-Item $tmp).Length -lt 2000){ throw 'downloaded file too small' }",
+    "Copy-Item $tmp $t -Force","Remove-Item $tmp -Force -ErrorAction SilentlyContinue","Write-Output 'SELFUPD_OK'"];
+  try{ var f=fso.CreateTextFile(ps1,true); f.Write(L.join("\r\n")); f.Close(); }catch(ew){ setStatus("Self-update stage failed: "+ew.message,"err"); return; }
+  try{ var r=runBat(['powershell -NoProfile -ExecutionPolicy Bypass -File "'+ps1+'" > "__LOG__" 2>&1']);
+    try{ fso.DeleteFile(ps1); }catch(e0){}
+    if((r.log+"").indexOf("SELFUPD_OK")>=0){ var b=$("selfUpd"); if(b) b.className="btn primary hide";
+      setStatus("Updated to v"+SELF_LATEST+" — CLOSE and reopen the app to run the new version.","ok");
+      try{ alert("Update installed (v"+SELF_LATEST+").\n\nClose and reopen "+SELF_HTA+" to run the new version."); }catch(e){}
+    } else { appendLog("--- self-update ---\n"+r.log); setStatus("Self-update failed — see log; download manually from GitHub if needed.","err"); }
+  }catch(e){ setStatus("Self-update failed: "+e.message,"err"); }
+}
+window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }catch(e){} };
+</script>
+<div id="helpModal" class="modal hide" onclick="if((event.srcElement||{}).id==='helpModal')closeHelp()">
+  <div class="mcard">
+    <span class="x" onclick="closeHelp()" title="Close">&times;</span>
+    <h2>SchedTasks Analyzer <span class="muted" style="font-size:13px;font-weight:400" id="helpVer"></span></h2>
+    <div class="gh muted">GitHub: <span class="lnk" onclick="openUrl(GITHUB)">https://github.com/bpmorris22/SchedTasks-Analyzer</span></div>
+    <p>A single-file GUI for <b>Windows scheduled-task triage</b> &mdash; what is registered to run on a host, as whom, launching what, and which of it looks like persistence or lateral movement. It parses the Task Scheduler XML under <code>Windows\System32\Tasks</code> itself (no external parser), cross-checks it against the SOFTWARE hive's <b>TaskCache</b> keys with Eric Zimmerman's RECmd when the hive is collected, and writes one CSV that opens in a scored triage view.</p>
+    <h3>Quick start</h3>
+    <ul>
+      <li>Point the input at a <b>host or collection folder</b> (every <code>Windows\System32\Tasks</code> below it is found &mdash; Velociraptor/KAPE trees work as-is), a <b>Tasks folder</b>, or a <b>single task file</b>. Then <b>Process &rarr; analyze</b>. A host takes seconds.</li>
+      <li>The SOFTWARE hive is found automatically beside each Tasks folder (<code>..\System32\config\SOFTWARE</code>, copied to %TEMP% with its <code>.LOG1/.LOG2</code>). The cross-check needs RECmd: it is found next to this app (<code>RECmd\</code>, shared with RECmd-Wrapper) or in <code>C:\ZimmermanTools</code>; <b>Download RECmd</b> fetches it. Without RECmd the XML triage still runs.</li>
+      <li>Or <b>Load existing CSV&hellip;</b> to reopen an earlier output (or view any CSV).</li>
+    </ul>
+    <h3>Command line</h3>
+    <p><code>mshta "SchedTasks-Analyzer.hta" "&lt;inputOrCsv&gt;" ["&lt;outDir&gt;"] [/auto] [/from:yyyy-MM-dd] [/to:yyyy-MM-dd]</code></p>
+    <ul>
+      <li><code>&lt;input&gt;</code> &mdash; a <code>.csv</code> (auto-loads into the viewer) or a host folder / Tasks folder / task file (prefilled; processed with <code>/auto</code>).</li>
+      <li><code>&lt;outDir&gt;</code> &mdash; CSV output directory (optional). &nbsp; <code>/auto</code> &mdash; process immediately (downloads RECmd first if it is missing and the web is reachable).</li>
+      <li><code>/from:yyyy-MM-dd</code> <code>/to:yyyy-MM-dd</code> &mdash; case window (UTC, inclusive): prefills the date filter and is recorded in runinfo; never affects scoring.</li>
+      <li><b>Target hostname</b> is required before processing &mdash; it names the output folder <code>_Processed\&lt;host&gt;\SchedTasks</code> next to this app (family convention shared with the Artifact-Finder). It is guessed from <code>Collection-&lt;host&gt;-&hellip;</code> paths or a passed <code>_Processed\&lt;host&gt;\</code> outDir &mdash; overwrite the guess if it's wrong.</li>
+      <li><b>Shared IOC list</b>: an <code>IOC.txt</code> next to this app (one term per line, <code>#</code> comments) is auto-merged into the IOC box at launch &mdash; one list covers the whole toolkit. Terms you paste locally are kept.</li>
+      <li>After every successful run a <code>runinfo.json</code> provenance entry (app, host, input path, files) is appended in the output folder, including a <b>triage summary</b> (entries, flagged count, max score, top hits) &mdash; the Artifact-Finder shows these per host in its inventory. RECmd's raw TaskCache CSVs are kept in a <code>TaskCache\</code> subfolder.</li>
+    </ul>
+    <h3>Scoring (flagged = score &ge; 3)</h3>
+    <ul>
+      <li><b>T1 IOC</b> +3 &middot; <b>T2 LOLBIN</b> +2 (script host / LOLBin launcher) &middot; <b>T3 CRADLE</b> +2 (IEX, download cradle, encoded command, hidden window) &middot; <b>T4 REMOTE</b> +2 (URL or UNC share) &middot; <b>T5 USERPATH</b> +2 (AppData, Temp, Public, ProgramData, Tasks folders&hellip;)</li>
+      <li>Non-Microsoft tasks only: <b>T6 SYSTEM</b> +1 (SYSTEM / highest privileges) &middot; <b>T7 S4U / PASSWORD</b> +1 &middot; <b>T9 HIDDEN</b> +1, <b>BEACON</b> +1 (repeats every &le; 15 min). <b>T8 ONESHOT</b> +1 (single time trigger ending within 24 h, or delete-after-expiry &mdash; the remote-push shape).</li>
+      <li>Structure: <b>T10 MALFORMED / NOTTASK</b> +2, <b>NOTUTF16</b> +1, <b>WOW64</b> +2 (file under SysWOW64\Tasks), <b>ATJOB</b> +2 / <b>JOB</b> +1 (legacy <code>.job</code>).</li>
+      <li>TaskCache: <b>NOSD</b> +3 (Tree key without its SD value &mdash; hidden from schtasks and the UI, the Tarrask technique) &middot; <b>REGONLY</b> +2 (registered, no XML on disk) &middot; <b>TREEONLY</b> +3 (a non-Microsoft Tree entry left behind with no Tasks key and no XML &mdash; residue of a task removed outside a normal delete; Microsoft leftovers of that shape are tagged STALE at +0) &middot; <b>XMLONLY</b> +1 (XML not registered) &middot; <b>REGDELETED</b> +1 (deleted task recovered from hive slack, with its actions decoded) &middot; <b>ACTMISMATCH</b> +2 (registry copy of the actions differs from the XML).</li>
+      <li>Tasks under <code>\Microsoft\</code> score <b>half</b> on T2 and T5 (Windows ships many script-host tasks there) but are <b>never exempt</b> &mdash; attackers hide tasks in that tree. Context tags at +0: MULTI, COM, DISABLED, ACCT-AUTHOR, URIMISMATCH, STALE.</li>
+    </ul>
+    <h3>Notes</h3>
+    <ul>
+      <li>Three views: <b>Tasks</b> (score-ranked), <b>Timeline</b> (by Changed) and <b>Folders</b> (per task folder &mdash; click one to drill in). The <code>run as:</code> dropdown (or clicking a Run-as cell) filters every view to one task principal.</li>
+      <li><b>Times.</b> Changed (UTC) comes from the collection's own file metadata when present (Velociraptor <code>results\&hellip;All Matches Metadata.json</code>), else the TaskCache Tree key LastWrite, else the file time. Extracted file times can carry the <b>unzip box's timezone error</b> (Velociraptor offline-collector ZIPs store local DOS times) &mdash; the app detects a consistent offset and says so above the overview. <code>RegDate</code> is copied verbatim from the XML: host-local unless it carries <code>Z</code>, and usually absent.</li>
+      <li>This reads the XML <b>on disk</b>. A task hidden by deleting its registry SD still has its XML and still shows here (and the cross-check tags it NOSD). A task whose XML was deleted but which is still registered shows as a registry-only row with its actions decoded from TaskCache.</li>
+      <li>Only tasks present at collection time appear. For created-then-deleted tasks also check TaskScheduler/Operational event 141 and Security 4699 (Hayabusa-Wrapper) and <code>$UsnJrnl</code> (MFTECmd-Wrapper); the TaskCache cross-check recovers some from hive slack.</li>
+      <li>A dirty hive is replayed with its transaction logs; if the logs are missing RECmd re-runs without them and the run says so. The <b>live</b> SOFTWARE hive is locked by Windows, so live runs are XML-only (and need an elevated mshta).</li>
+      <li>COM-handler actions are shown as raw CLSIDs; SIDs are raw apart from the well-known ones. Columns are resizable &mdash; drag a header's right edge; double-click to reset.</li>
+      <li>CSV values are written unmodified. Arguments can begin with <code>-</code>, <code>+</code>, <code>=</code> or <code>@</code>: open the CSV in this app or Timeline Explorer rather than Excel.</li>
+    </ul>
+    <p class="muted" style="font-size:11px">MIT &copy; 2026 Ben Morris &mdash; click the link above for the full README &amp; releases.</p>
+  </div>
+</div>
+
+</body>
+</html>
