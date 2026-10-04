@@ -60,10 +60,19 @@
       be registered (or recoverable from slack) there.
 
   Event logs (v0.2.0) - native wevtutil, no PowerShell:
-    wevtutil qe "<evtx>" /lf:true /q:"*[System[(EventID=...)]]" /f:xml /e:Events > out.xml
+    wevtutil qe "<evtx>" /lf:true /q:"*[System[(EventID=...)]]" /rd:true /c:200000 /f:xml /e:Events > out.xml
     writes UTF-8 (no BOM) when redirected, one <Events> root; ~0.3 s for a full 10 MB TaskScheduler log, 1.5 s
     to filter an 879 MB Security log. (Get-WinEvent + ToXml took 130-250 s for the same logs.)
+    EVERY event is on ONE line between "<Events>\r\n" and "</Events>\r\n" (v0.2.1, measured). /rd:true /c:N = the
+    newest N matches (verified on an evtx with a /q: filter). Reading an export whole cost ~10x its size in
+    memory (82 MB -> 833 MB; 246 MB -> 2.6 GB and 95 s frozen): it is read in ~4M-character slices cut after
+    the last "</Event>", each parsed as its own small document. ADODB.Stream.LoadFromFile holds the whole file
+    (bytes) until Close - the /c: cap bounds that. Exports are NOT always valid UTF-8 (raw cp1252 quotes seen in
+    a real Security export); ADODB's utf-8 ReadText(n) drops characters after such bytes, so exports are read
+    byte-exact (charset iso-8859-1) and decoded by utf8Run. ADODB "iso-8859-1" best-fits on WRITE (windows-1252 does not).
     Velociraptor stores the log as Microsoft-Windows-TaskScheduler%254Operational.evtx (double-encoded).
+    Exit codes (v0.2.1, measured): 0 + an empty <Events></Events> when nothing matches; non-zero when the query
+    fails (3 = path not found; 5 = access denied - the live Security channel from a non-elevated process).
     TaskScheduler/Operational EventData names: 100/102/110 TaskName, UserContext, InstanceId; 101 + ResultCode;
     106 TaskName, UserContext; 129 TaskName, Path, ProcessID; 140/141/142 TaskName, UserName; 200 TaskName,
     ActionName, TaskInstanceId; 201/202/203 + ResultCode. Security 4698-4702: Subject*, TaskName, TaskContent
@@ -310,7 +319,7 @@
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "0.2.0";
+var APP_VERSION = "0.2.1";
 var KNOWN_LATEST_RECMD = "2.0.0.0";                                            // baseline 2026-10-03 (C:\ZimmermanTools copy)
 var RECMD_ZIP_URL = "https://download.ericzimmermanstools.com/RECmd.zip";      // official EZ mirror (folder-shaped: exe + Plugins + BatchExamples)
 var RECMD_PAGE = "https://ericzimmerman.github.io/";                           // for live latest-version lookup
@@ -440,6 +449,19 @@ function writeUtf8(path,text){
   }
   var fso=new ActiveXObject("Scripting.FileSystemObject");
   var f=fso.CreateTextFile(path,true,false); f.Write(text); f.Close();
+}
+/* the same, written in pieces: w.add(text) ... w.close() - a large file is never one joined string */
+function utf8Writer(path){
+  var w={st:null, f:null};
+  if(FILE_IO==="adodb"){ try{ w.st=new ActiveXObject("ADODB.Stream"); w.st.Type=2; w.st.Charset="utf-8"; w.st.Open(); }catch(e){ w.st=null; } }
+  if(!w.st) w.f=new ActiveXObject("Scripting.FileSystemObject").CreateTextFile(path,true,false);
+  w.add=function(t){ if(w.st) w.st.WriteText(t); else w.f.Write(t); };
+  w.close=function(){
+    if(!w.st){ w.f.Close(); return; }
+    try{ w.st.SaveToFile(path,2); w.st.Close(); return; }
+    catch(e){ if(!/safety settings|data source/i.test(e.message||"")) throw e; FILE_IO="fso"; zoneNote(); }
+    w.st.Position=0; var all=w.st.ReadText(-1); w.st.Close(); writeUtf8(path, all); };
+  return w;
 }
 function uid(){ return new Date().getTime()+""+Math.floor(Math.random()*100000); }
 /* cmd expands %N / %VAR% inside .bat lines even within quotes — Velociraptor trees contain literal % (C%3A) */
@@ -829,6 +851,13 @@ var EVT_MEANING={100:"Task started",101:"Task start failed",102:"Task completed"
   4698:"Task created (Security)",4699:"Task deleted (Security)",4700:"Task enabled (Security)",4701:"Task disabled (Security)",
   4702:"Task updated (Security)"};
 var EVT_SEC_MAX=2147483648;          // Security.evtx above 2 GB is not staged / queried (say so; Hayabusa-Wrapper covers it)
+/* event-export memory bounds (v0.2.1, stress-measured - BUILD-NOTES 3e): reading an export whole cost ~10x its size
+   (82 MB -> 833 MB, 246 MB -> 2.6 GB, UI frozen 95 s). Now: the NEWEST EVT_MAX_EVENTS per log (wevtutil /rd:true /c:,
+   a warning when reached), parsed in EVT_SLICE_CHARS slices, TaskContent kept per event up to EVT_CONTENT_MAX characters
+   of distinct definitions (each task's latest definition is always kept) */
+var EVT_MAX_EVENTS=200000;
+var EVT_SLICE_CHARS=4194304;
+var EVT_CONTENT_MAX=33554432;
 var QUICKDEL_SECS=600;               // T16: registered (or updated), run and deleted within 10 min - fleet-tuned 2026-10-04: Windows Update
                                      // deletes tasks right after an update with no run; Windows 11 SoftLanding tasks self-delete during a run hours
                                      // after registration; a real remote-execution task was registered, run and deleted in 0.15 s
@@ -1054,9 +1083,9 @@ function stageRoots(){
       lines.push("echo Event logs (this machine) - root "+en+" ...");
       re.evtXml.push({log:"TaskScheduler", f:R.stage+"\\ev"+en+"_ts.xml", src:"Microsoft-Windows-TaskScheduler/Operational"});
       re.evtXml.push({log:"Security", f:R.stage+"\\ev"+en+"_sec.xml", src:"Security"});
-      lines.push('wevtutil qe "Microsoft-Windows-TaskScheduler/Operational" /q:"'+evtQuery(EVT_TS_IDS)+'" /f:xml /e:Events > "'+batEsc(re.evtXml[0].f)+'" 2>> "__LOG__"');
+      lines.push('wevtutil qe "Microsoft-Windows-TaskScheduler/Operational" /q:"'+evtQuery(EVT_TS_IDS)+'" /rd:true /c:'+EVT_MAX_EVENTS+' /f:xml /e:Events > "'+batEsc(re.evtXml[0].f)+'" 2>> "__LOG__"');
       lines.push('>> "__LOG__" echo EVTQ '+en+' TaskScheduler %ERRORLEVEL%');
-      lines.push('wevtutil qe "Security" /q:"'+evtQuery(EVT_SEC_IDS)+'" /f:xml /e:Events > "'+batEsc(re.evtXml[1].f)+'" 2>> "__LOG__"');
+      lines.push('wevtutil qe "Security" /q:"'+evtQuery(EVT_SEC_IDS)+'" /rd:true /c:'+EVT_MAX_EVENTS+' /f:xml /e:Events > "'+batEsc(re.evtXml[1].f)+'" 2>> "__LOG__"');
       lines.push('>> "__LOG__" echo EVTQ '+en+' Security %ERRORLEVEL%');
       continue; }
     var lg=evtLogsFor(re.path);
@@ -1072,7 +1101,8 @@ function stageRoots(){
     lines.push('>> "__LOG__" echo EVROBO '+en+' %ERRORLEVEL%');
     for(ci=0;ci<cp.length;ci++){ var isTs=(cp[ci]===lg.ts), lab=isTs?"TaskScheduler":"Security", pre=R.stage+"\\ev"+en+(isTs?"_ts":"_sec"), sf=ed+"\\"+cp[ci];
       re.evtXml.push({log:lab, f:pre+".xml", old:pre+"_old.xml", nw:pre+"_new.xml", src:lg.dir+"\\"+cp[ci]});
-      lines.push('wevtutil qe "'+batEsc(sf)+'" /lf:true /q:"'+evtQuery(isTs?EVT_TS_IDS:EVT_SEC_IDS)+'" /f:xml /e:Events > "'+batEsc(pre)+'.xml" 2>> "__LOG__"');
+      // newest first, at most EVT_MAX_EVENTS: bounds the export at the source (summaries sort by time, so order is irrelevant)
+      lines.push('wevtutil qe "'+batEsc(sf)+'" /lf:true /q:"'+evtQuery(isTs?EVT_TS_IDS:EVT_SEC_IDS)+'" /rd:true /c:'+EVT_MAX_EVENTS+' /f:xml /e:Events > "'+batEsc(pre)+'.xml" 2>> "__LOG__"');
       lines.push('>> "__LOG__" echo EVTQ '+en+' '+lab+' %ERRORLEVEL%');
       // log coverage (oldest / newest record of the WHOLE log): a task missing from a short log proves nothing
       lines.push('wevtutil qe "'+batEsc(sf)+'" /lf:true /c:1 /rd:false /f:xml > "'+batEsc(pre)+'_old.xml" 2> nul');
@@ -1104,6 +1134,8 @@ function afterStage(){
       if(rbc>=8 || rbc<0){ R.warn.push("Could not copy the RegBack hive for root "+r.n+" (exit "+rbc+") - RegBack sweep skipped."); r.rbHive=""; } }
     if(r.evtXml && r.evtXml.length && !r.evtLive){ var evc=logCode(log,"EVROBO",r.n);
       if(evc>=8 || evc<0){ R.warn.push("Could not copy the event logs for root "+r.n+" (exit "+evc+") - event-log correlation skipped."); r.evtXml=[]; } }
+    // wevtutil's exit code per query ("EVTQ <root> <log> <code>"): a failed query is not "no task events"
+    if(r.evtXml){ for(var q=0;q<r.evtXml.length;q++) r.evtXml[q].q=logCode(log,"EVTQ",r.n+" "+r.evtXml[q].log); }
     r.files=[]; walkStage(fso, r.stageDir, "", r, r.files, 0);
     for(var j=0;j<r.files.length;j++) R.files.push(r.files[j]);
   }
@@ -1381,13 +1413,14 @@ function readTcCsvs(bf, pf){
   for(i=0;i<tc.all.length;i++){ var le=tc.all[i]; if(le.guid && (!tc.byGuid[le.guid] || tc.byGuid[le.guid].del)) tc.byGuid[le.guid]=le; }
   // Tasks\{GUID} keys: GUID first. Fall back to the path only when that entry has no GUID yet or the SAME GUID - a
   // different GUID at the same path (e.g. a deleted registration recovered from hive slack) is a separate task.
+  // del: true = only a slack copy of the Tasks key, false = a live key, null = metadata only (liveness left alone)
   function claim(g, path, del){
     var po=trimStr(path||""); if(!po) po="(TaskCache "+g+")";      // keys recovered from hive slack can lose their Path value
     var p=normTaskPath(po), pe=tc.byGuid[g], pk=tc.byKey[p];
     if(!pe && pk && (!pk.guid || pk.guid===g)) pe=pk;
     if(!pe){ pe=pk?entry(p,!!del,po,g):entry(p,!!del,po); pe.hasId=false; }
     if(path && pe.disp===pe.path) pe.disp=po;                      // prefer the original-case path
-    if(!pe.guid) pe.guid=g; tc.byGuid[g]=pe; if(del) pe.tasksDel=true; else pe.inTasks=true;   // only a LIVE Tasks key means registered; a slack copy just adds its data
+    if(!pe.guid) pe.guid=g; tc.byGuid[g]=pe; if(del===true) pe.tasksDel=true; else if(del===false) pe.inTasks=true;   // only a LIVE Tasks key means registered; a slack copy just adds its data
     return pe; }
   for(var tg in tk){ if(!tk.hasOwnProperty(tg)) continue; tc.nTasks++;
     var t=tk[tg], te2=claim(tg, t.path, !!t.delSeen && !t.liveSeen);
@@ -1397,7 +1430,9 @@ function readTcCsvs(bf, pf){
   if(pf){ tc.plugin=true;
     for(i=1;i<raw.length;i++){ r=raw[i]; if(r.length<6) continue;
       var pg=String(cell(r,idx.KeyName)).toUpperCase(); if(!/^\{[0-9A-F\-]+\}$/.test(pg)) continue;
-      var pe2=claim(pg, cell(r,idx.Path), false);
+      // the batch decides whether a Tasks key is live (a plugin row says nothing about slack): metadata only, unless the
+      // batch never saw this key at all
+      var pe2=claim(pg, cell(r,idx.Path), tk.hasOwnProperty(pg)?null:false);
       if(!pe2.created){ pe2.created=normTs(cell(r,idx.CreatedOn)); pe2.lastStart=normTs(cell(r,idx.LastStart)); pe2.lastStop=normTs(cell(r,idx.LastStop));
         pe2.state=cell(r,idx.TaskState); pe2.result=cell(r,idx.LastActionResult); }
       pe2.author=cell(r,idx.Author); pe2.desc=cell(r,idx.Description); pe2.source=cell(r,idx.Source); } }
@@ -1440,10 +1475,14 @@ function regBackTime(root){
   try{ var f=new ActiveXObject("Scripting.FileSystemObject").GetFile(root.rbStage+"\\"+baseName(root.rbHive)); var s=dateUtcStr(f.DateLastModified); return s?(s+" (file time)"):""; }catch(e){ return ""; }
 }
 function mergeRegBack(root, tc, rb){
-  var i, nMark=0, nAdd=0, nDel=0;
+  var i, j, nMark=0, nAdd=0, nDel=0, nOther=0;
   tc.rbUtc=regBackTime(root);
   for(i=0;i<rb.all.length;i++){ var b=rb.all[i], st=b.del?"deleted":(b.inTasks?"registered":"tree-only");
-    var cur=tc.byKey[b.path] || tc.byKey[b.path+"|del"];
+    // the same registration = the same GUID. The path alone only when one side has no GUID (a valueless slack key): a
+    // backup registration under ANOTHER GUID at a current path is a different task (removed / re-created since) and keeps
+    // its own record - merging it would hide it and lend its actions / times to the current one
+    var cur=b.guid?(tc.byGuid[b.guid]||null):null, other=false, pc=[tc.byKey[b.path], tc.byKey[b.path+"|del"]];
+    for(j=0;!cur && j<pc.length;j++){ if(!pc[j]) continue; if(!b.guid || !pc[j].guid || pc[j].guid===b.guid) cur=pc[j]; else other=true; }
     if(cur){ if(!cur.rbStatus || st==="registered") cur.rbStatus=st;
       // the current hive lost data the backup still has (a tree-only residue, a slack key): borrow it, labelled
       if(!cur.regActions && b.regActions){ cur.acts=b.acts; cur.regActions=b.regActions+" [RegBack]"; cur.regCmds=b.regCmds; }
@@ -1451,9 +1490,10 @@ function mergeRegBack(root, tc, rb){
       if(!cur.author && b.author) cur.author=b.author;
       nMark++; continue; }
     if(/^\\microsoft\\/.test(b.path) && !b.inTasks && !b.del && b.index==="0") continue;   // stale Microsoft leftover there too
-    var k=b.path+(st==="deleted"?"|rbdel":"|rb"); if(tc.byKey[k]) continue;
-    b.rbOnly=true; b.rbStatus=st; b.key=k; tc.byKey[k]=b; tc.all.push(b); nAdd++; if(st==="deleted") nDel++; }
-  appendLog("Root "+root.n+": RegBack copy ("+(tc.rbUtc||"time unknown")+") - "+rb.all.length+" task entries; "+nMark+" also in the current hive, "+(nAdd-nDel)+" registered there but gone now, "+nDel+" deleted keys recovered from its slack.");
+    var k=b.path+(st==="deleted"?"|rbdel":"|rb")+(other?("|"+b.guid):""); if(tc.byKey[k]) continue;   // never joined to the XML of that path
+    b.rbOnly=true; b.rbStatus=st; b.key=k; tc.byKey[k]=b; tc.all.push(b); nAdd++; if(st==="deleted") nDel++; if(other) nOther++; }
+  appendLog("Root "+root.n+": RegBack copy ("+(tc.rbUtc||"time unknown")+") - "+rb.all.length+" task entries; "+nMark+" also in the current hive, "+(nAdd-nDel)+" registered there but gone now, "+nDel+" deleted keys recovered from its slack"
+    +(nOther?(" ("+nOther+" of them under another GUID at a path the current hive still has)"):"")+".");
 }
 /* ---------- event logs (A): wevtutil XML -> one record per event -> one summary per task ----------
    TaskScheduler/Operational records the lifecycle (106 registered, 140 updated, 141 deleted) and every run
@@ -1479,6 +1519,8 @@ function evtFromNode(ev, log, src, wd){
   // event 129 can name the task by its task-host account form ("NT TASK\MicrosoftEdgeUpdateTaskMachineCore"): same task
   if(/^\\?NT TASK\\/i.test(o.task)) o.task="\\"+o.task.replace(/^\\?NT TASK\\/i,"");
   o.user=d.UserContext||d.UserName||(d.SubjectUserName?((d.SubjectDomainName?(d.SubjectDomainName+"\\"):"")+d.SubjectUserName):"");
+  // who, for account comparisons: Security names SYSTEM / LOCAL / NETWORK SERVICE as the machine account (DOMAIN\HOST$) - use the SID
+  o.acct=/^S-1-5-(18|19|20)$/i.test(trimStr(d.SubjectUserSid||""))?trimStr(d.SubjectUserSid):o.user;
   o.action=d.Path||d.ActionName||""; o.inst=d.InstanceId||d.TaskInstanceId||""; o.pid=d.ProcessID||""; o.res=d.ResultCode||"";
   o.content=d.TaskContent||d.TaskContentNew||"";
   o.ts=evtTs(o.t); o.ms=evtMs(o.t);
@@ -1487,56 +1529,169 @@ function evtFromNode(ev, log, src, wd){
 function evtSpan(x){
   function one(p){ try{ if(!p || !fileExists(p)) return ""; var m=String(readUtf8(p)).match(/SystemTime=["']([^"']+)["']/); return m?evtTs(m[1]).substring(0,19):""; }catch(e){ return ""; } }
   return {old:one(x.old), nw:one(x.nw)}; }
-/* async, in slices: a 10 MB TaskScheduler log is ~16k events; the UI stays live and shows progress */
+/* one wevtutil export -> a slice cursor, or null when there is nothing to parse. x.q = wevtutil's exit code (afterStage):
+   0 with no <Event> = the log holds no task events (wevtutil writes an empty <Events/>); anything else is a FAILED query
+   (access denied on the live Security log, an unreadable / corrupt evtx) and must say so - otherwise the run ends "ok"
+   with that log silently missing from the correlation */
+function openEvtExport(root, x){
+  var R=RUN, qf=(x.q!=null && x.q!==0), cur;
+  if(x.old) root.evt.span[x.log]=evtSpan(x);
+  if(qf) R.warn.push("wevtutil could not query the "+x.log+" log for root "+root.n+" ("+(x.q<0?"no exit code recorded":("exit "+x.q+(x.q===5?" - access denied":"")))+") - its task events are missing or incomplete; see the log.");
+  if(!fileExists(x.f)){ appendLog("Root "+root.n+": "+x.log+" - "+(qf?"query failed":"no task events (no export - see the log for the wevtutil error)")); return null; }
+  cur={root:root, x:x, rd:null, nodes:null, dom:null, i:0, len:0, n:0, total:0, bad:0, badWhy:"", lo:""};
+  try{ cur.rd=evtReaderOpen(x.f); }catch(e1){ R.warn.push("Could not read the "+x.log+" event export for root "+root.n+": "+e1.message); return null; }
+  if(!evtNextSlice(cur)){ evtExportDone(cur); return null; }
+  return cur;
+}
+/* a wevtutil export in bounded slices. wevtutil writes EVERY event on one line, so reading an export whole meant one
+   string and one DOM for all of it (~10x the export in memory, the UI frozen for the parse). A slice ends after its last
+   complete "</Event>" (markup never occurs inside text - evidence text is entity-escaped) and is parsed as its own small
+   <Events> document. ADODB still holds the export's bytes: the wevtutil /c: cap bounds those.
+   The export is read BYTE-EXACT (charset iso-8859-1 = windows-1252: 256 bytes -> 256 distinct chars) and decoded per
+   slice (utf8Run): exports can hold invalid UTF-8 - wevtutil wrote raw cp1252 quotes from a task description on a real
+   host - and ADODB's utf-8 ReadText(n) then silently DROPS characters at the end of that 64K read (it broke an entity). */
+function evtReaderOpen(path){
+  var rd={buf:"", eof:false, st:null, ts:null, tail:"", size:0};
+  if(FILE_IO==="adodb"){
+    try{ var st=new ActiveXObject("ADODB.Stream"); st.Type=2; st.Charset="iso-8859-1"; st.Open(); st.LoadFromFile(path); rd.st=st; rd.size=st.Size; return rd; }
+    catch(e){ if(!/safety settings|data source/i.test(e.message||"")) throw e; FILE_IO="fso"; zoneNote(); }
+  }
+  rd.ts=new ActiveXObject("Scripting.FileSystemObject").OpenTextFile(path,1,false,0); return rd;
+}
+function evtReaderPart(rd){ var k=Math.min(65536, EVT_SLICE_CHARS); if(rd.st) return rd.st.EOS?"":rd.st.ReadText(k); return rd.ts.AtEndOfStream?"":rd.ts.Read(k); }
+function evtReaderClose(rd){ try{ if(rd.st) rd.st.Close(); }catch(e){} try{ if(rd.ts) rd.ts.Close(); }catch(e2){} rd.st=null; rd.ts=null; }
+/* -> the next run of complete events ("" when a slice held none), or null at the end (rd.tail = what was left after the
+   last "</Event>": the closing </Events>, or a cut-off event) */
+function evtReaderNext(rd){
+  var parts=[rd.buf], n=rd.buf.length, want=EVT_SLICE_CHARS, t="", cut=-1;
+  for(;;){
+    while(!rd.eof && n<want){ var s=evtReaderPart(rd); if(!s){ rd.eof=true; break; } parts.push(s); n+=s.length; }
+    t=parts.join(""); cut=t.lastIndexOf("</Event>");
+    if(cut>=0 || rd.eof) break;
+    parts=[t]; want+=EVT_SLICE_CHARS; }                                 // one event longer than a slice: read on until it closes
+  if(cut<0){ rd.buf=""; rd.tail=t; return null; }
+  rd.buf=t.substring(cut+8);
+  var b=t.search(/<Event[\s>]/), s=(b>=0 && b<cut)?t.substring(b, cut+8):"";
+  return /[^\x00-\x7f]/.test(s)?s.replace(/[^\x00-\x7f]+/g, utf8Run):s;   // a UTF-8 sequence is all high bytes: never split by a run
+}
+/* windows-1252 code points of bytes 80-9F as ADODB "iso-8859-1" reads them (the five undefined bytes pass through) */
+var CP1252_HI=[0x20AC,0x81,0x201A,0x192,0x201E,0x2026,0x2020,0x2021,0x2C6,0x2030,0x160,0x2039,0x152,0x8D,0x17D,0x8F,
+  0x90,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x2DC,0x2122,0x161,0x203A,0x153,0x9D,0x17E,0x178], CP1252_REV=null;
+function cpByte(c){ if(c<0x80 || (c>=0xA0 && c<=0xFF)) return c;
+  if(!CP1252_REV){ CP1252_REV={}; for(var i=0;i<32;i++) CP1252_REV[CP1252_HI[i]]=0x80+i; }
+  var b=CP1252_REV[c]; return (b==null)?-1:b; }
+/* a run of non-ASCII characters read byte-for-byte -> the text it encodes: valid UTF-8 sequences are decoded, any other
+   byte keeps its windows-1252 meaning */
+function utf8Run(run){
+  var b=[], out=[], i, k;
+  for(i=0;i<run.length;i++) b.push(cpByte(run.charCodeAt(i)));
+  for(i=0;i<b.length;){ var c=b[i], n=0, cp=0, lo=0x80, hi=0xBF, ok;
+    if(c>=0xC2 && c<=0xDF){ n=1; cp=c&0x1F; }
+    else if(c>=0xE0 && c<=0xEF){ n=2; cp=c&0x0F; if(c===0xE0) lo=0xA0; else if(c===0xED) hi=0x9F; }
+    else if(c>=0xF0 && c<=0xF4){ n=3; cp=c&0x07; if(c===0xF0) lo=0x90; else if(c===0xF4) hi=0x8F; }
+    ok=(n>0 && i+n<b.length);
+    for(k=1; ok && k<=n; k++){ var d=b[i+k]; if(d<(k===1?lo:0x80) || d>(k===1?hi:0xBF)) ok=false; else cp=(cp<<6)|(d&0x3F); }
+    if(!ok){ out.push(run.charAt(i)); i++; continue; }
+    if(cp>0xFFFF){ cp-=0x10000; out.push(String.fromCharCode(0xD800+(cp>>10), 0xDC00+(cp&0x3FF))); } else out.push(String.fromCharCode(cp));
+    i+=n+1; }
+  return out.join("");
+}
+function evtNextSlice(cur){
+  cur.nodes=null; cur.dom=null; cur.i=0; cur.len=0;
+  for(;;){ var s=evtReaderNext(cur.rd); if(s===null) return false; if(!s) continue;
+    var d=newDom(), ok=false; if(!d) throw new Error("MSXML is not available");
+    try{ ok=d.loadXML("<Events>"+s+"</Events>"); }catch(e){ ok=false; }
+    if(!ok || !d.documentElement){ cur.bad++; if(!cur.badWhy && d.parseError) cur.badWhy=trimStr(d.parseError.reason); continue; }   // skip it, keep going
+    cur.dom=d; cur.nodes=d.documentElement.childNodes; cur.len=cur.nodes.length; return true; }
+}
+function evtExportDone(cur){
+  var R=RUN, x=cur.x, root=cur.root, sp=root.evt.span[x.log], qf=(x.q!=null && x.q!==0), rd=cur.rd;
+  if(rd) evtReaderClose(rd);
+  cur.nodes=null; cur.dom=null;
+  if(cur.bad) R.warn.push(nf(cur.bad)+" part(s) of the "+x.log+" event export for root "+root.n+" could not be parsed"+(cur.badWhy?(" ("+cur.badWhy+")"):"")+" - the events in them are skipped.");
+  if(rd && /<Event[\s>]/.test(rd.tail)) R.warn.push("The "+x.log+" event export for root "+root.n+" ends inside an event (cut off?) - the events before it were read.");
+  if(cur.total>=EVT_MAX_EVENTS) R.warn.push("The "+x.log+" log for root "+root.n+" reached the "+nf(EVT_MAX_EVENTS)+"-event cap: only its newest "+nf(EVT_MAX_EVENTS)+" task events were read (back to "+cur.lo.substring(0,19)+" UTC) - older ones are not correlated; run Hayabusa-Wrapper on this log.");
+  if(!cur.total) appendLog("Root "+root.n+": "+x.log+" - "+(qf?"query failed":"no task events"));
+  else appendLog("Root "+root.n+": "+x.log+" - "+nf(cur.n)+" task event(s)"+(sp&&sp.old?(", log covers "+sp.old+" -> "+sp.nw+" UTC"):""));
+}
+/* TaskContent (the whole task XML in 4698 / 4702) is ~2-5 KB per event and dominated memory. Each task's LATEST definition
+   is always kept (evt.defs - what fillEvt recovers a definition from). Per event, a definition identical to the task's
+   previous one shares that string; distinct ones are kept until EVT_CONTENT_MAX characters, after which the event's copy
+   is dropped (ev.contentCut - the companion CSV says so). */
+function evtKeep(evt, ev){
+  var c=ev.content; if(!c) return;
+  var k=normTaskPath(ev.task), d=evt.defs[k];
+  if(!d || ev.t>d.t || (ev.t===d.t && (+ev.rec||0)>(+d.rec||0))) evt.defs[k]={t:ev.t, rec:ev.rec, id:ev.id, content:c};
+  if(evt.last[k]===c){ ev.content=evt.last[k]; return; }
+  evt.last[k]=c;
+  if(evt.kept+c.length<=EVT_CONTENT_MAX){ evt.kept+=c.length; return; }
+  ev.content=""; ev.contentCut=true; evt.cut++;
+}
+/* async: ~1500 events per tick, slice after slice; the UI stays live and shows progress */
 function parseEvents(){
   var R=RUN;
   try{
     if(!R.evCur){
       if(!R.evQ.length){ window.setTimeout(joinAndWrite, 10); return; }
       var root=R.evQ[0];
-      root.evt=root.evt||{list:[], span:{}};
-      while(root.evtXml.length && !R.evCur){ var x=root.evtXml.shift();
-        if(x.old) root.evt.span[x.log]=evtSpan(x);
-        var txt=""; try{ if(fileExists(x.f)) txt=String(readUtf8(x.f)); }catch(e1){ R.warn.push("Could not read the "+x.log+" event export for root "+root.n+": "+e1.message); }
-        if(!/<Event[\s>]/.test(txt)){ appendLog("Root "+root.n+": "+x.log+" - no task events"+(txt?"":" (no export - see the log for the wevtutil error)")); continue; }
-        var d=newDom(), ok=false; if(d){ try{ ok=d.loadXML(txt); }catch(e2){ ok=false; } }
-        if(!ok || !d.documentElement){ R.warn.push("The "+x.log+" event export for root "+root.n+" could not be parsed"+(d&&d.parseError?(" ("+trimStr(d.parseError.reason)+")"):"")+" - skipped."); continue; }
-        R.evCur={root:root, x:x, nodes:d.documentElement.childNodes, i:0, n:0, dom:d}; }
+      root.evt=root.evt||{list:[], span:{}, defs:{}, last:{}, kept:0, cut:0};
+      while(root.evtXml.length && !R.evCur) R.evCur=openEvtExport(root, root.evtXml.shift());
       if(!R.evCur){ R.evQ.shift(); window.setTimeout(parseEvents, 1); return; }
     }
-    var cur=R.evCur, nodes=cur.nodes, len=nodes.length, end=Math.min(cur.i+1500, len), wd=winKey(cur.root);
-    for(; cur.i<end; cur.i++){ var nd=nodes[cur.i]; if(nd.nodeType!==1) continue;
-      var ev=evtFromNode(nd, cur.x.log, cur.x.src, wd); if(ev && ev.task){ cur.root.evt.list.push(ev); cur.n++; } }
-    setStatus("Reading the "+cur.x.log+" event log... "+nf(cur.i)+" / "+nf(len)+" events","muted");
-    if(cur.i>=len){ var sp=cur.root.evt.span[cur.x.log];
-      appendLog("Root "+cur.root.n+": "+cur.x.log+" - "+nf(cur.n)+" task event(s)"+(sp&&sp.old?(", log covers "+sp.old+" -> "+sp.nw+" UTC"):""));
-      R.evCur=null; if(!cur.root.evtXml.length) R.evQ.shift(); }
+    var cur=R.evCur, evt=cur.root.evt, wd=winKey(cur.root), left=1500, more=true;
+    while(left>0){
+      if(cur.total>=EVT_MAX_EVENTS){ more=false; break; }                // the query is capped already; this is the backstop
+      if(cur.i>=cur.len){ if(!(more=evtNextSlice(cur))) break; continue; }
+      var nd=cur.nodes[cur.i++]; if(nd.nodeType!==1) continue; left--; cur.total++;
+      var ev=evtFromNode(nd, cur.x.log, cur.x.src, wd);
+      if(ev && ev.task){ evtKeep(evt, ev); evt.list.push(ev); cur.n++; if(ev.ts && (!cur.lo || ev.ts<cur.lo)) cur.lo=ev.ts; } }
+    var pct=(cur.rd && cur.rd.st && cur.rd.size)?(" ("+Math.floor(100*cur.rd.st.Position/cur.rd.size)+"%)"):"";
+    setStatus("Reading the "+cur.x.log+" event log... "+nf(cur.total)+" events"+pct,"muted");
+    if(!more){ evtExportDone(cur); R.evCur=null; if(!cur.root.evtXml.length) R.evQ.shift(); }
     window.setTimeout(parseEvents, 1);
-  }catch(ex){ R.warn.push("Event-log parsing failed: "+ex.message); R.evQ=[]; R.evCur=null; window.setTimeout(joinAndWrite, 10); }
+  }catch(ex){ if(R.evCur && R.evCur.rd) evtReaderClose(R.evCur.rd); R.warn.push("Event-log parsing failed: "+ex.message); R.evQ=[]; R.evCur=null; window.setTimeout(joinAndWrite, 10); }
 }
 /* events of one collection -> per-task summaries (key = normalized task path) */
-/* account equality across event sources: "ACME\\jdoe" = "jdoe", "NT AUTHORITY\\System" = "SYSTEM"; unknown is never equal */
-function acctKey(a){ a=trimStr(String(a||"")).toLowerCase(); if(!a) return ""; a=a.substring(a.lastIndexOf("\\")+1); return (a==="localsystem")?"system":a; }
-function sameAcct(a,b){ var x=acctKey(a), y=acctKey(b); return !!x && x===y; }
-function evtSummaries(list){
+/* account identity across event sources (100 UserContext, 141 UserName, Security Subject*). SYSTEM / LOCAL SERVICE /
+   NETWORK SERVICE by name or SID; DOMAIN\user compared whole (the same name in another domain is another account). A bare
+   name vs DOMAIN\name, a UPN vs DOMAIN\name, or a missing account cannot be decided: unknown, never "same" or "different" */
+var ACCT_WK={"SYSTEM":1,"LOCAL SERVICE":1,"NETWORK SERVICE":1};
+function acctId(a){ a=trimStr(String(a||"")); if(!a) return null;
+  var w=wellKnown(a); if(ACCT_WK[w]) return {wk:w};
+  a=a.toLowerCase(); var bs=a.lastIndexOf("\\");
+  if(bs>=0) return {dom:a.substring(0,bs), name:a.substring(bs+1)};
+  return (a.indexOf("@")>0)?{upn:a}:{name:a}; }
+/* 1 = the same account, -1 = a different one, 0 = cannot tell */
+function acctCmp(a,b){ var x=acctId(a), y=acctId(b);
+  if(!x || !y) return 0;
+  if(x.wk || y.wk) return (x.wk===y.wk)?1:-1;
+  if(x.upn || y.upn) return (x.upn && y.upn)?((x.upn===y.upn)?1:-1):0;
+  if(x.name!==y.name) return -1;
+  if(x.dom==null || y.dom==null) return 0;
+  return (x.dom===y.dom)?1:-1; }
+function evtSummaries(list, defs){   // defs: per-task latest TaskContent (evtKeep) - wins over the events' own copies, which may be dropped
   var by={}, out=[], i, j;
   list.sort(function(a,b){ return a.t<b.t?-1:(a.t>b.t?1:((+a.rec||0)-(+b.rec||0))); });
   for(i=0;i<list.length;i++){ var e=list[i], k=normTaskPath(e.task), s=by[k], id=e.id;
     if(!s){ s=by[k]={key:k, disp:(e.task.charAt(0)==="\\"?"":"\\")+e.task, evts:[], src:{}, life:"", regAt:0, ranSince:false, runUser:"", gap:-1, selfGap:-1, inst100:{}, inst200:{}, n100:0, n200:0, n129:0, runs:[]}; out.push(s); }
     s.evts.push(e); s.src[e.src]=1;
-    if(id===106 || id===4698){ if(!s.reg) s.reg=e; s.life="reg"; s.regAt=e.ms; s.ranSince=false; s.runUser=""; if(e.content){ s.content=e.content; s.contentId=id; } }
-    else if(id===140 || id===4702){ s.upd=e; if(s.life!=="del") s.life="reg"; s.regAt=e.ms; s.ranSince=false; s.runUser=""; if(e.content){ s.content=e.content; s.contentId=id; } }
-    else if(id===141 || id===4699){ s.del=e; s.life="del";
+    // lifecycle = the LAST registration / update / deletion: a task updated or re-registered after a deletion exists again
+    // (the deletion stays in s.del as history); lifeTs = when that last lifecycle event happened
+    if(id===106 || id===4698){ if(!s.reg) s.reg=e; s.life="reg"; s.lifeTs=e.ts; s.regAt=e.ms; s.ranSince=false; s.runUser=""; if(e.content){ s.content=e.content; s.contentId=id; } }
+    else if(id===140 || id===4702){ s.upd=e; s.life="reg"; s.lifeTs=e.ts; s.regAt=e.ms; s.ranSince=false; s.runUser=""; if(e.content){ s.content=e.content; s.contentId=id; } }
+    else if(id===141 || id===4699){ s.del=e; s.life="del"; s.lifeTs=e.ts;
       // gap = this deletion minus the (re-)registration / update before it, counted only when the task RAN in between -
       // the register-run-delete shape (min over deletions)
-      // ... split by WHO deleted it: the account it ran as (self-cleaning software) or another one (the operator)
-      if(s.regAt && s.ranSince && e.ms>=s.regAt){ var g=e.ms-s.regAt;
-        if(sameAcct(s.runUser, e.user)){ if(s.selfGap<0 || g<s.selfGap) s.selfGap=g; } else if(s.gap<0 || g<s.gap) s.gap=g; }
+      // ... split by WHO deleted it: the account it ran as (self-cleaning software) or a PROVEN other one (the operator).
+      // An unknown run or delete account (no 100 UserContext, ambiguous names) goes in neither - it proves nothing
+      if(s.regAt && s.ranSince && e.ms>=s.regAt){ var g=e.ms-s.regAt, ac=acctCmp(s.runUser, e.acct||e.user);
+        if(ac>0){ if(s.selfGap<0 || g<s.selfGap) s.selfGap=g; } else if(ac<0 && (s.gap<0 || g<s.gap)) s.gap=g; }
       s.regAt=0; s.ranSince=false; s.runUser=""; }
-    else if(id===100){ if(e.inst && !s.inst100[e.inst]){ s.inst100[e.inst]=1; s.n100++; } s.runs.push(e.ts); s.ranSince=true; if(e.user) s.runUser=e.user; }
+    else if(id===100){ if(e.inst && !s.inst100[e.inst]){ s.inst100[e.inst]=1; s.n100++; } s.runs.push(e.ts); s.ranSince=true; if(e.user) s.runUser=e.acct||e.user; }
     else if(id===200){ if(e.inst && !s.inst200[e.inst]){ s.inst200[e.inst]=1; s.n200++; } s.ranSince=true; }
     else if(id===129){ s.n129++; s.ranSince=true; } }
-  for(i=0;i<out.length;i++){ var su=out[i];
+  for(i=0;i<out.length;i++){ var su=out[i], df=defs?defs[su.key]:null;
+    if(df){ su.content=df.content; su.contentId=df.id; }
     su.status=(su.life==="del")?"deleted":((su.life==="reg")?"registered":"logged");
     su.nRuns=su.n100||su.n200||su.n129;
     var rt=[]; for(j=0;j<su.evts.length;j++){ var ej=su.evts[j]; if(ej.id===100 || (!su.n100 && (ej.id===200 || ej.id===129))) rt.push(ej.ts); }
@@ -1560,6 +1715,7 @@ function fillEvt(row, s){
   row.EvtDeletedUtc=s.del?s.del.ts.substring(0,19):""; row.EvtDeletedBy=s.del?s.del.user:"";
   row.EvtDeleteGapSecs=(s.gap>=0)?String(Math.round(s.gap/100)/10):""; row.EvtSelfDeleteGapSecs=(s.selfGap>=0)?String(Math.round(s.selfGap/100)/10):"";
   row.EvtFirstRunUtc=s.firstRun.substring(0,19); row.EvtLastRunUtc=s.lastRun.substring(0,19);
+  row._evtLast=s.lifeTs?s.lifeTs.substring(0,19):"";                  // not a CSV column: only feeds ChangedUtc in joinAndWrite
   row.EvtActions=s.imgs.join(" | ");
   if(row.AllActions || row.Command || row.ComClassId) return;
   // no surviving definition: Security 4698 / 4702 carries the whole task XML when object-access auditing is on
@@ -1621,8 +1777,9 @@ function joinAndWrite(){
       // is attacker-writable and must not let one file claim another task's registration. (Flat / single-file
       // inputs already use <URI> as their TaskPath, so nothing is lost there.)
       if(r.tc){ var jp=normTaskPath(row.TaskPath), e=r.tc.byKey[jp] || r.tc.byKey[jp+"|del"] || r.tc.byKey[jp+"|rb"] || r.tc.byKey[jp+"|rbdel"];
-        // only a DELETED (or RegBack-only) registration left: the XML is unregistered in the current hive
-        if(e){ e.used=true; fillReg(row,e,r.tc); row.RegStatus=(e.del||e.rbOnly)?"xml-only":"matched"; }
+        // matched = a LIVE Tasks key. A deleted or RegBack-only registration, or a Tree leaf whose Tasks key is gone (residue),
+        // leaves the XML unregistered in the current hive - xml-only, and the registered-task checks (NOSD) do not apply
+        if(e){ e.used=true; fillReg(row,e,r.tc); row.RegStatus=(e.del||e.rbOnly||!e.inTasks)?"xml-only":"matched"; }
         else if(/^(ok|not-utf16|malformed)$/.test(row.ParseStatus)) row.RegStatus="xml-only"; } }
     // every TaskCache entry no XML claimed becomes its own row (registered-only, tree-only, or deleted & recovered)
     for(i=0;i<R.roots.length;i++){ r=R.roots[i]; if(!r.tc || r.shareWith) continue;   // a shared hive emits its leftovers once, from its owner root
@@ -1631,7 +1788,8 @@ function joinAndWrite(){
     // event-log correlation (A): each task's events go to its best row; a task known ONLY from the log gets its own row
     var nEvtRoots=0, nEvtTasks=0, nEvtOnly=0, evOut=[];
     for(i=0;i<R.roots.length;i++){ r=R.roots[i]; if(!r.evt) continue; nEvtRoots++;
-      var sums=evtSummaries(r.evt.list), wk=winKey(r), best={}, eo=0;
+      var sums=evtSummaries(r.evt.list, r.evt.defs), wk=winKey(r), best={}, eo=0;
+      if(r.evt.cut) R.warn.push("Root "+r.n+": TaskContent past the "+nf(EVT_CONTENT_MAX)+"-character budget was left out of the events companion CSV for "+nf(r.evt.cut)+" older event(s); every task's latest definition is still used.");
       for(j=0;j<R.rows.length;j++){ row=R.rows[j]; if(winKey(row._root)!==wk) continue;
         var bk=normTaskPath(row.TaskPath), rk=rowRank(row); if(!best[bk] || rk<best[bk].rk) best[bk]={row:row, rk:rk}; }
       for(j=0;j<sums.length;j++){ var su=sums[j], bt=best[su.key];
@@ -1641,9 +1799,11 @@ function joinAndWrite(){
       appendLog("Root "+r.n+": event log - "+nf(r.evt.list.length)+" task event(s) for "+sums.length+" task path(s); "+eo+" known only from the log."); }
     if(!R.rows.length){ runFail("Nothing to report: no task files were staged and neither the TaskCache sweep nor the event logs returned a task"+(R.warn.length?(" - "+R.warn.join(" ")):".")); return; }
     for(i=0;i<R.rows.length;i++){ row=R.rows[i]; var nx=(row.ParseStatus==="no-xml");
-      var evLast=row.EvtDeletedUtc||[row.EvtUpdatedUtc,row.EvtRegisteredUtc,row.EvtLastRunUtc].sort().pop()||"";
+      // the deletion counts only when it is the log's LAST word: a task re-registered / updated after it is not gone
+      var evDel=(row.EvtStatus==="deleted")?row.EvtDeletedUtc:"";
+      var evLast=evDel||[row._evtLast||"",row.EvtUpdatedUtc,row.EvtRegisteredUtc,row.EvtLastRunUtc].sort().pop()||"";
       if(row.FileTimeSource==="vr-metadata"){ row.ChangedUtc=row.FileModifiedUtc; row.ChangedSource="vr-metadata"; }
-      else if(nx && row.EvtDeletedUtc && (!row.TreeLastWriteUtc || row.EvtDeletedUtc>row.TreeLastWriteUtc)){ row.ChangedUtc=row.EvtDeletedUtc; row.ChangedSource="event-log"; }   // gone: when it went
+      else if(nx && evDel && (!row.TreeLastWriteUtc || evDel>row.TreeLastWriteUtc)){ row.ChangedUtc=evDel; row.ChangedSource="event-log"; }   // gone: when it went
       else if(row.TreeLastWriteUtc){ row.ChangedUtc=row.TreeLastWriteUtc; row.ChangedSource="taskcache-tree"; }
       else if(row.RegCreatedUtc && nx){ row.ChangedUtc=row.RegCreatedUtc; row.ChangedSource="taskcache-created"; }
       else if(nx && evLast){ row.ChangedUtc=evLast; row.ChangedSource="event-log"; }
@@ -1655,12 +1815,18 @@ function joinAndWrite(){
     try{ var fso=new ActiveXObject("Scripting.FileSystemObject"); if(!fso.FolderExists(R.outdir)) runBat(['mkdir "'+batEsc(R.outdir)+'" > "__LOG__" 2>&1']); }catch(em){}
     writeUtf8(path, lines.join("\r\n")+"\r\n");
     // companion CSV: every task event, one row each (the detail pane's per-task history; loads on its own as a plain table)
-    if(nEvtRoots){ var evName=R.stamp+"_SchedTasks_Events.csv", el=[EVTCOLS.join(",")];
+    // written in pieces (never one joined string); TaskContent only when it CHANGES - a repeat of the task's previous
+    // definition (Security 4702 noise re-logs the same XML) is noted, not copied again
+    if(nEvtRoots){ var evName=R.stamp+"_SchedTasks_Events.csv", ew=utf8Writer(R.outdir+"\\"+evName), el=[EVTCOLS.join(",")], prevDef={};
       evOut.sort(function(a,b){ return a.t<b.t?-1:(a.t>b.t?1:((+a.rec||0)-(+b.rec||0))); });
-      for(i=0;i<evOut.length;i++){ var ev=evOut[i];
+      for(i=0;i<evOut.length;i++){ var ev=evOut[i], tcx="";
+        if(ev.content){ var dk=ev.wd+"|"+normTaskPath(ev.task); if(prevDef[dk]===ev.content) tcx="[same as this task's previous TaskContent]"; else { tcx=ev.content; prevDef[dk]=ev.content; } }
+        else if(ev.contentCut) tcx="[not kept - over the TaskContent budget]";
         el.push([cq(ev.ts),cq(ev.id),cq(EVT_MEANING[ev.id]||""),cq(ev.log),cq(ev.task),cq(ev.user),cq(ev.action),cq(ev.inst),cq(ev.pid),
-          cq(ev.res),cq(ev.rec),cq(ev.wd),cq(ev.src),cq(ev.content)].join(",")); }
-      writeUtf8(R.outdir+"\\"+evName, el.join("\r\n")+"\r\n"); produced.push({name:evName}); }
+          cq(ev.res),cq(ev.rec),cq(ev.wd),cq(ev.src),cq(tcx)].join(","));
+        if(el.length>=5000){ ew.add(el.join("\r\n")+"\r\n"); el=[]; } }
+      if(el.length) ew.add(el.join("\r\n")+"\r\n");
+      ew.close(); produced.push({name:evName}); }
     cleanupStage(R.stage);
     var nTc=0, nMeta=0, nRb=0; for(i=0;i<R.roots.length;i++){ if(R.roots[i].tc) nTc++; if(R.roots[i].meta) nMeta++; if(R.roots[i].tc && R.roots[i].rbHive && !R.roots[i].shareWith) nRb++; }
     appendLog("Wrote "+path+" - "+R.rows.length+" row(s) from "+R.roots.length+" root(s); TaskCache cross-check on "+nTc+(nRb?(" (+ RegBack copy on "+nRb+")"):"")+", event logs on "+nEvtRoots+" ("+nEvtTasks+" task path(s), "+nEvtOnly+" only in the log), collection time metadata on "+nMeta+".");
@@ -1967,7 +2133,7 @@ function scoreRec(r){
     if(ms && r.TreeIndex==="0") info("STALE","Stale Microsoft TaskCache Tree entry (Index 0, no Tasks key, no XML) - normal upgrade leftover");
     else add(ms?2:3,"TREEONLY","TaskCache Tree entry left behind with no Tasks key and no XML - residue of a "+(ms?"":"non-Microsoft ")+"task removed outside a normal delete (its name and Tree LastWrite are all that remain)"); }
   else if(rs==="xml-only") add(1,"XMLONLY","Task XML is not registered in TaskCache - dropped file, cleaned registry, or the hive copy predates it");
-  else if(rs==="regback-only") add(ms?1:2,"REGBACK","Registered in the RegBack copy of the SOFTWARE hive ("+(r.RegBackUtc||"backup time unknown")+") but gone from the current hive and the Tasks folder - removed after that backup"+(ms?" (Microsoft tree - half weight)":""));
+  else if(rs==="regback-only") add(ms?1:2,"REGBACK","Registered in the RegBack copy of the SOFTWARE hive ("+(r.RegBackUtc||"backup time unknown")+") but that registration is gone from the current hive and has no task XML - removed (or re-created under another GUID) after that backup"+(ms?" (Microsoft tree - half weight)":""));
   else if(rs==="deleted") add(1,"REGDELETED","Deleted task recovered from "+(/\\regback\\/i.test(r.SourceFile)?"the RegBack copy of the SOFTWARE hive":"the SOFTWARE hive")+" (registry slack)");
   if(actMismatch(r)) add(2,"ACTMISMATCH","TaskCache's copy of the actions differs from the task XML");
   // T15-T17 event log (TaskScheduler/Operational, Security 4698-4702). "Gone" = no XML and no live registration now.
@@ -1979,7 +2145,7 @@ function scoreRec(r){
     if(!isNaN(gap) && gap<=QUICKDEL_SECS) add(ms?1:2,"QUICKDEL","Registered, run and deleted in "+fmtGap(gap)+" by an account other than the one it ran as - the register-run-delete shape of remote execution (atexec, schtasks /create /run /delete)"+(ms?" (Microsoft tree - half weight)":""));
     var sg=parseFloat(r.EvtSelfDeleteGapSecs);
     if(!(gap<=QUICKDEL_SECS) && !isNaN(sg) && sg<=QUICKDEL_SECS) info("SELFDEL","Registered, run and deleted in "+fmtGap(sg)+" by the account it ran as - how installers and Windows helpers clean up after themselves"); }
-  else if(r.EvtStatus && gone && !rs) add(1,"EVTONLY","Known only from the event log - no XML, no TaskCache entry and no logged deletion");
+  else if(r.EvtStatus && gone && !rs) add(1,"EVTONLY","Known only from the event log - no XML, no TaskCache entry, and the log does not end with its deletion");
   if(r.EvtDefinition) info("EVTDEF","Task definition recovered from the Security log ("+r.EvtDefinition+" TaskContent) - no XML survives");
   // tag-only context (+0) - candidates to promote after tuning
   if((+r.ActionCount||0)>1 && !/ \[event log\]/.test(r.AllActions)) info("MULTI","Task has "+r.ActionCount+" actions");   // images seen in the log ran at different times
