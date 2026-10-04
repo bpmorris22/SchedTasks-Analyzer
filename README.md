@@ -26,7 +26,7 @@ The task XML parser is built in. RECmd is only needed for the registry cross-che
   - **XML-only** files that were never registered;
   - **Tree-only residue** of tasks removed outside a normal delete;
   - **deleted** registrations RECmd recovers from the hive;
-  - **hidden tasks** whose Tree key lost its SD value (the "Tarrask" technique);
+  - **hidden tasks** whose Tree key lost its SD value (the "Tarrask" technique) — skipped with a warning on a host where *most* entries lack an SD, which means a partial hive copy rather than tradecraft;
   - registry actions that **differ** from the XML;
   - registered and last-run times.
 - **Trustworthy times** — files unzipped from an offline collection can carry the analysis box's timezone error. Changed (UTC) prefers the collection's own file metadata, then the TaskCache LastWrite, and the app warns when it detects a consistent offset.
@@ -64,7 +64,7 @@ mshta "SchedTasks-Analyzer.hta" "<inputOrCsv>" ["<outDir>"] [/auto] [/from:yyyy-
 - **Target hostname** is required before processing — it names that folder (family convention shared with the [DFIR-Windows-Artifact-Finder](https://github.com/bpmorris22/DFIR-Windows-Artifact-Finder)). Guessed from `Collection-<host>-…` paths or a passed `_Processed\<host>\` outDir.
 - **Shared IOC list** — an `IOC.txt` next to the app (one term per line, `#` comments) is merged into the IOC box at launch.
 - **Run provenance + triage summary** — every run appends a `runinfo.json` entry (app, host, input, files, case window, flagged count, max score, top hits) in the output folder; the Artifact-Finder shows these per host. RECmd's raw TaskCache CSVs are kept in a `TaskCache\` subfolder.
-- `/from:yyyy-MM-dd` `/to:yyyy-MM-dd` — case window (UTC, inclusive): prefills the date filter and is recorded in `runinfo.json`; never affects scoring.
+- `/from:yyyy-MM-dd` `/to:yyyy-MM-dd` — case window (UTC, inclusive): tasks changed inside it are marked **in window** and counted in a chip beside the date boxes (**filter to it** applies it as a filter). It does **not** pre-filter the list — a task that matters is often created long before the window — and it is recorded in `runinfo.json` and never scored.
 
 ## Notes
 

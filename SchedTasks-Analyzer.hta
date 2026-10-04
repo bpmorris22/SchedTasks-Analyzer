@@ -22,7 +22,9 @@
   of the DFIR-Artifact-Finder toolkit. No external parser for the task XML: this app parses it itself
   (MSXML6). RECmd is used ONLY for the optional TaskCache registry cross-check.
 
-  Contracts VERIFIED 2026-10-03 against 17 Velociraptor collections (3,084 task files) + RECmd 2.0.0.0:
+  Contracts VERIFIED 2026-10-03 against 17 Velociraptor collections (3,084 task files) + RECmd 2.0.0.0, and
+  re-checked 2026-10-04 against RECmd 2026.5.0 (identical batch output; its plugin CSV adds Command,
+  Arguments and SecurityDescriptor columns - every column is read by name):
 
   Task XML (Windows\System32\Tasks\...): extensionless, UTF-16 LE with BOM (FF FE), root
     <Task version="1.x" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">. FSO unicode
@@ -197,6 +199,7 @@
     <div class="card">
       <h3 id="ovTitle">Overview</h3>
       <div id="skewWarn" class="warnbar hide"></div>
+      <div id="sdWarn" class="warnbar hide"></div>
       <div id="statbar"></div>
     </div>
 
@@ -241,6 +244,7 @@
           <span class="muted">&rarr;</span>
           <input class="txt mono" id="dto" placeholder="to YYYY-MM-DD" style="width:140px" title="Filter by Changed (UTC)">
         </span>
+        <span id="caseChip" class="hide"></span>
         <span class="sep"></span>
         <button class="btn" id="iocBtn">IOC / keywords&hellip;</button>
         <button class="btn" id="clearBtn">clear</button>
@@ -248,6 +252,7 @@
         <button class="btn" id="copyBtn">Copy for case notes</button>
         <span class="muted" id="count" style="margin-left:8px"></span>
       </div>
+      <div id="dateWarn" class="warnbar hide"></div>
       <div id="iocWrap" class="hide" style="margin-bottom:8px">
         <label class="fld">IOC / keyword list &mdash; comma or newline separated; matched (case-insensitive substring) against the task path, author, description, run-as account and every action's command, arguments, working directory and COM class / data (XML and registry copies). Matches score +3 and light up red in the detail pane.</label>
         <textarea id="iocBox" rows="3" style="width:70%;vertical-align:top"></textarea>
@@ -271,7 +276,7 @@
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "0.1.0";
+var APP_VERSION = "0.1.1";
 var KNOWN_LATEST_RECMD = "2.0.0.0";                                            // baseline 2026-10-03 (C:\ZimmermanTools copy)
 var RECMD_ZIP_URL = "https://download.ericzimmermanstools.com/RECmd.zip";      // official EZ mirror (folder-shaped: exe + Plugins + BatchExamples)
 var RECMD_PAGE = "https://ericzimmerman.github.io/";                           // for live latest-version lookup
@@ -1232,14 +1237,21 @@ function loadTaskCache(root){
     var dec=decodeActions(acts[ag].hex);
     if(dec){ var al=[], cl=[], k2; for(k2=0;k2<dec.acts.length;k2++){ al.push(fmtAction(dec.acts[k2])); if(dec.acts[k2].t==="Exec") cl.push(dec.acts[k2].cmd); }
       ae.acts=dec.acts; ae.regActions=al.join(" || ")+(dec.ok?"":" (partially decoded)"); ae.regCmds=cl.join(" | "); } }
-  appendLog("Root "+root.n+": TaskCache - "+tc.all.length+" Tree task entries, "+(pf?"plugin times present":"NO plugin output (times blank)")+(tc.nl?", processed without log replay":""));
+  // SD sanity: Tarrask-style hiding removes the SD from one or two tasks. When most of a host's live Tree
+  // leaves have no SD, the data cannot support the check (partial / sparse hive copy, parser difference):
+  // record SD as "unknown" instead of flagging every task as hidden.
+  var live=0, noSd=0;
+  for(i=0;i<tc.all.length;i++){ if(tc.all[i].hasId && !tc.all[i].del){ live++; if(!tc.all[i].sd) noSd++; } }
+  tc.sdBulk=(live>=6 && noSd>live*0.25);
+  if(tc.sdBulk) RUN.warn.push("Root "+root.n+": "+noSd+" of "+live+" TaskCache Tree entries carry no SD value - too many to be hidden tasks, so the hidden-task (NOSD) check is not applied on this host. Check the hive copy (sparse / partial upload?).");
+  appendLog("Root "+root.n+": TaskCache - "+tc.all.length+" Tree task entries ("+live+" live, "+(live-noSd)+" with SD"+(tc.sdBulk?" - SD check disabled":"")+"), "+(pf?"plugin times present":"NO plugin output (times blank)")+(tc.nl?", processed without log replay":""));
   return tc;
 }
 function resultHex(v){ var n=parseInt(v,10); if(isNaN(n)) return String(v||""); if(n<0) n+=4294967296; return "0x"+hx(n,8); }
-function fillReg(row, e){
+function fillReg(row, e, tc){
   row.RegGuid=e.guid||""; row.RegCreatedUtc=e.created||""; row.RegLastStartUtc=e.lastStart||""; row.RegLastStopUtc=e.lastStop||"";
   row.RegLastResult=(e.result!=null && e.result!=="")?resultHex(e.result):""; row.RegTaskState=e.state||"";
-  row.TreeLastWriteUtc=e.treeLw||""; row.TreeIndex=e.index||""; row.TreeSD=e.hasId?(e.sd?"yes":"no"):"";
+  row.TreeLastWriteUtc=e.treeLw||""; row.TreeIndex=e.index||""; row.TreeSD=e.hasId?(e.sd?"yes":((tc && tc.sdBulk)?"unknown":"no")):"";
   row.RegActions=e.regActions||""; row.RegActionCommands=e.regCmds||"";
 }
 function regOnlyRow(root, e){
@@ -1249,7 +1261,7 @@ function regOnlyRow(root, e){
   r.TasksRoot=root.path; r.SourceFile=root.hive+" [TaskCache"+(e.guid?(" "+e.guid):"")+"]";
   r.ParseStatus="no-xml";
   r.RegStatus=(e.del||e.tasksDel)?"deleted":(e.inTasks?"reg-only":"tree-only");
-  fillReg(r,e);
+  fillReg(r,e,root.tc);
   r.Author=e.author||""; r.Description=e.desc||""; r.Source=e.source||"";
   if(e.acts && e.acts.length){ var a0=e.acts[0];
     r.ActionCount=String(e.acts.length); r.ActionType=a0.t; r.AllActions=r.RegActions; r.ActionCommands=r.RegActionCommands;
@@ -1269,7 +1281,7 @@ function joinAndWrite(){
       // is attacker-writable and must not let one file claim another task's registration. (Flat / single-file
       // inputs already use <URI> as their TaskPath, so nothing is lost there.)
       if(r.tc){ var e=r.tc.byKey[normTaskPath(row.TaskPath)] || r.tc.byKey[normTaskPath(row.TaskPath)+"|del"];
-        if(e){ e.used=true; fillReg(row,e); row.RegStatus=e.del?"xml-only":"matched"; }   // only a DELETED registration left: the XML is unregistered
+        if(e){ e.used=true; fillReg(row,e,r.tc); row.RegStatus=e.del?"xml-only":"matched"; }   // only a DELETED registration left: the XML is unregistered
         else if(/^(ok|not-utf16|malformed)$/.test(row.ParseStatus)) row.RegStatus="xml-only"; } }
     // every TaskCache entry no XML claimed becomes its own row (registered-only, tree-only, or deleted & recovered)
     for(i=0;i<R.roots.length;i++){ r=R.roots[i]; if(!r.tc || r.shareWith) continue;   // a shared hive emits its leftovers once, from its owner root
@@ -1424,7 +1436,9 @@ function ingestTasks(raw, idx, srcLabel){
   $("results").className="";
   var nRoot=0; for(k in roots){ if(roots.hasOwnProperty(k)) nRoot++; }
   $("srcpill").innerHTML=nf(ROWS.length)+" tasks &middot; "+nf(nRoot)+" root(s) &middot; "+esc(srcLabel);
-  QUERY=""; $("q").value=""; DFROM=CASE_FROM?dayNum(CASE_FROM):0; DTO=CASE_TO?dayNum(CASE_TO):0; $("dfrom").value=CASE_FROM||""; $("dto").value=CASE_TO||"";
+  // the case window marks rows, it does not pre-filter them (v0.1.1): start with every task visible
+  QUERY=""; $("q").value=""; DFROM=0; DTO=0; $("dfrom").value=""; $("dto").value="";
+  updateCaseChip(); updateSdWarn();
   CURCAT="all"; highlightCat(); updateFolderChip();
   SORTKEY=0; SORTDIR=1; TSORTKEY=0; TSORTDIR=-1; CSORTKEY=4; CSORTDIR=-1;
   setView("tasks", true);
@@ -1432,6 +1446,14 @@ function ingestTasks(raw, idx, srcLabel){
   var fl=0; for(i=0;i<ROWS.length;i++) if(ROWS[i].sus) fl++;
   setStatus("Loaded "+nf(ROWS.length)+" task(s) - "+nf(fl)+" flagged","ok");
   render();
+}
+function updateSdWarn(){
+  var el=$("sdWarn"); if(!el) return;
+  var n=0, i; for(i=0;i<ROWS.length;i++){ if(ROWS[i].TreeSD==="unknown") n++; }
+  if(!n){ el.innerHTML=""; showEl("sdWarn",false); return; }
+  el.innerHTML="&#9888; "+nf(n)+" task(s) come from a host where most TaskCache entries have no SD value. That is a data problem (e.g. a sparse or partial hive copy), not "
+    +"a mass of hidden tasks, so the hidden-task check (NOSD) was not applied to them - they carry the SD-UNKNOWN tag instead. The other TaskCache findings are unaffected.";
+  showEl("sdWarn",true);
 }
 function populateTagSel(){
   var counts={}, i, j; for(i=0;i<ROWS.length;i++){ for(j=0;j<ROWS[i].tags.length;j++){ var t=ROWS[i].tags[j]; counts[t]=(counts[t]||0)+1; } }
@@ -1538,6 +1560,7 @@ function scoreRec(r){
   // T11-T14 TaskCache cross-check
   var rs=r.RegStatus;
   if(r.TreeSD==="no" && rs!=="deleted") add(3,"NOSD","TaskCache Tree key has no SD value - hidden from schtasks and the Task Scheduler UI (Tarrask technique)");
+  else if(r.TreeSD==="unknown") info("SD-UNKNOWN","Most of this host's TaskCache entries have no SD value, so a missing SD here is a data issue, not evidence of hiding - the NOSD check was not applied");
   if(rs==="reg-only") add(2,"REGONLY","Registered in TaskCache but the task XML is missing - still runs, invisible to anyone reading the Tasks folder");
   else if(rs==="tree-only"){
     // normal deletion removes the Tree key, the Tasks key and the XML together. Microsoft upgrade leftovers
@@ -1634,7 +1657,7 @@ var COLS=[
   {h:"State", sk:stateKey, cell:function(r){return '<td>'+stateHtml(r)+'</td>';}},
   {h:"Author", sk:function(r){return String(r.Author).toLowerCase();}, cell:function(r){return '<td class="mono muted" title="'+esc(r.Author)+'">'+esc(r.Author)+'</td>';}},
   {h:"Last run (UTC)", sk:function(r){return msOf(r.RegLastStartUtc);}, cell:function(r){return '<td class="mono">'+esc(r.RegLastStartUtc)+'</td>';}},
-  {h:"Changed (UTC)", sk:function(r){return r.ms;}, cell:function(r){return '<td class="mono">'+esc(r.ChangedUtc)+srcChip(r.ChangedSource)+'</td>';}}
+  {h:"Changed (UTC)", sk:function(r){return r.ms;}, cell:function(r){return '<td class="mono">'+esc(r.ChangedUtc)+srcChip(r.ChangedSource)+caseMark(r)+'</td>';}}
 ];
 function tagHtml(r){
   var t="", i, why=esc(r.reasons.join("; "));
@@ -1647,7 +1670,7 @@ function tagHtml(r){
   return t;
 }
 function filteredPf(){
-  var out=[];
+  var out=[], hidden=0, hiddenSus=0;
   for(var i=0;i<ROWS.length;i++){
     var r=ROWS[i];
     if(USERFILTER && r.user!==USERFILTER) continue;
@@ -1662,13 +1685,37 @@ function filteredPf(){
     if(CURCAT==="hidden"&&r.Hidden!=="true") continue;
     if(CURCAT==="disabled"&&r.Enabled!=="false") continue;
     if(CURCAT==="reg"&&!hasRegTag(r)) continue;
-    if(DFROM&&(!r.day||r.day<DFROM)) continue;
-    if(DTO&&(!r.day||r.day>DTO)) continue;
     if(QUERY){ if(r.blob.indexOf(QUERY)<0) continue; }
+    if((DFROM&&(!r.day||r.day<DFROM)) || (DTO&&(!r.day||r.day>DTO))){ hidden++; if(r.sus) hiddenSus++; continue; }   // counted, never silently dropped
     out.push(r);
   }
+  updateDateWarn(hidden, hiddenSus);
   return out;
 }
+/* the date boxes are a VIEW filter on Changed (UTC). Persistence routinely predates a case window and
+   Changed is the last write, not the last run - so whenever the dates hide rows, say how many (and how
+   many flagged) instead of letting an empty table read as "no tasks". */
+function updateDateWarn(hidden, hiddenSus){
+  var el=$("dateWarn"); if(!el) return;
+  if(!hidden){ el.innerHTML=""; showEl("dateWarn",false); return; }
+  el.innerHTML="&#9888; The date filter ("+esc(($("dfrom").value||"...")+" &rarr; "+($("dto").value||"..."))+", on Changed UTC) is hiding <b>"+nf(hidden)+"</b> task(s)"
+    +(hiddenSus?(", <b>"+nf(hiddenSus)+" of them flagged</b>"):"")+" - tasks created before the window can still be active. "
+    +'<span class="lnk" data-cleardates="1">clear the dates</span>';
+  showEl("dateWarn",true);
+}
+/* case window (/from /to): MARKS rows changed inside it and counts them; it no longer pre-filters the
+   list (v0.1.1) - a one-click chip applies it as a filter when wanted. Never scored. */
+function inCaseWindow(r){ if(!(CASE_FROM||CASE_TO) || !r.day) return false;
+  return (!CASE_FROM || r.day>=dayNum(CASE_FROM)) && (!CASE_TO || r.day<=dayNum(CASE_TO)); }
+function updateCaseChip(){
+  var el=$("caseChip"); if(!el) return;
+  if(!(CASE_FROM||CASE_TO) || MODE!=="tasks"){ el.innerHTML=""; showEl("caseChip",false); return; }
+  var n=0; for(var i=0;i<ROWS.length;i++){ if(inCaseWindow(ROWS[i])) n++; }
+  el.innerHTML='<span class="sep"></span><span class="chip warn" title="Case window passed by the Artifact-Finder (/from /to). Rows changed inside it are marked in the Changed column; this does not filter the list.">case window '
+    +esc((CASE_FROM||"...")+" -> "+(CASE_TO||"..."))+' &middot; '+nf(n)+' changed in it &middot; <span class="lnk" data-casewin="1" title="Apply the case window as a date filter">filter to it</span></span>';
+  showEl("caseChip",true);
+}
+function caseMark(r){ return inCaseWindow(r)?' <span class="chip warn" title="Changed inside the case window">in window</span>':""; }
 function updateCatCounts(){
   var c={all:ROWS.length,sus:0,nonms:0,ioc:0,exec:0,com:0,hidden:0,disabled:0,reg:0};
   for(var i=0;i<ROWS.length;i++){ var r=ROWS[i];
@@ -1836,7 +1883,7 @@ function gripReset(e){
 
 /* ---------- timeline view (same tasks sorted by Changed) ---------- */
 var TCOLS=[
-  {h:"Changed (UTC)", sk:function(r){return r.ms;}, cell:function(r){return '<td class="mono">'+esc(r.ChangedUtc)+srcChip(r.ChangedSource)+'</td>';}},
+  {h:"Changed (UTC)", sk:function(r){return r.ms;}, cell:function(r){return '<td class="mono">'+esc(r.ChangedUtc)+srcChip(r.ChangedSource)+caseMark(r)+'</td>';}},
   {h:"Tags", sk:function(r){return -r.score;}, cell:function(r){return '<td class="first">'+tagHtml(r)+'</td>';}},
   {h:"Task path", sk:function(r){return r.pathL;}, cell:function(r){return '<td class="mono'+(r.inMs?' muted':'')+'" title="'+esc(r.TaskPath)+'">'+esc(r.TaskPath)+'</td>';}},
   {h:"Action", sk:function(r){return r.actL;}, cell:function(r){return '<td class="mono" title="'+esc(r.AllActions)+'">'+esc(actionText(r))+'</td>';}},
@@ -2079,7 +2126,7 @@ function setMode(m){
   MODE=m; var pf=(m==="tasks");
   showEl("pfCards",pf); showEl("pfCats",pf); showEl("pfDateCtl",pf); showEl("pfFoot",pf);
   showEl("iocBtn",pf); showEl("viewToggle",pf);
-  if(!pf){ showEl("iocWrap",false); closeDetail(); showEl("userWrap",false); showEl("tagWrap",false); showEl("rootWrap",false); showEl("folderChip",false); showEl("skewWarn",false); }
+  if(!pf){ showEl("iocWrap",false); closeDetail(); showEl("userWrap",false); showEl("tagWrap",false); showEl("rootWrap",false); showEl("folderChip",false); showEl("skewWarn",false); showEl("sdWarn",false); showEl("dateWarn",false); showEl("caseChip",false); }
   if(pf) showEl("srcWrap",false);
   $("ovTitle").innerHTML = pf ? "Overview &mdash; reflects active filters" : "Overview";
   $("tableTitle").innerHTML = pf ? viewTitle(VIEW) : "Records";
@@ -2270,6 +2317,8 @@ function init(){
     var dfo=ga("data-folder");
     if(dfo!=null&&dfo!==""){ FOLDERFILTER=dfo; updateFolderChip(); setView("tasks", true); render(); return; }
     if(ga("data-clearfolder")){ FOLDERFILTER=""; updateFolderChip(); render(); return; }
+    if(ga("data-cleardates")){ $("dfrom").value=""; $("dto").value=""; DFROM=0; DTO=0; render(); return; }
+    if(ga("data-casewin")){ $("dfrom").value=CASE_FROM||""; $("dto").value=CASE_TO||""; DFROM=CASE_FROM?dayNum(CASE_FROM):0; DTO=CASE_TO?dayNum(CASE_TO):0; render(); return; }
     var q=ga("data-q");
     if(q){ $("q").value=q; QUERY=q.toLowerCase(); render(); return; }
     if(MODE!=="tasks" || VIEW==="folders") return;
@@ -2343,15 +2392,16 @@ function tokenizeCmdTail(){ var cl=getCommandLine(); if(!cl) return [];
     if(c===' '||c==='\t'){ if(cur!==""){toks.push(cur);cur="";} i++; continue; }
     cur+=c; i++; }
   if(cur!=="") toks.push(cur); return toks; }
-/* ---------- case window (family, 2026-07-07) ----------
-   /from:/to: (UTC calendar dates) prefill this app's existing date filter before any /auto run,
-   and are recorded in runinfo.json. FILTER ONLY — the window never touches scoring (attackers
-   stage outside the known window; the operator can always widen the filter inside the tool). */
+/* ---------- case window (family, 2026-07-07; behaviour changed in v0.1.1) ----------
+   /from:/to: (UTC calendar dates) are recorded in runinfo.json and never touch scoring. Unlike the other
+   wrappers, this app does NOT prefill its date filter with them: a scheduled task that matters is often
+   created long before the window, and filtering by Changed hid every task on a real host. The window
+   instead marks and counts the rows changed inside it; the "filter to it" chip applies it on demand. */
 var CASE_FROM="", CASE_TO="";
 function applyCaseWindow(from,to){
-  if(from){ if(/^\d{4}-\d{2}-\d{2}$/.test(from)){ CASE_FROM=from; try{ $("dfrom").value=from; DFROM=dayNum(from); }catch(e){} } else appendLog("CLI: ignoring invalid /from value '"+from+"'"); }
-  if(to){ if(/^\d{4}-\d{2}-\d{2}$/.test(to)){ CASE_TO=to; try{ $("dto").value=to; DTO=dayNum(to); }catch(e2){} } else appendLog("CLI: ignoring invalid /to value '"+to+"'"); }
-  if(CASE_FROM||CASE_TO) appendLog("CLI: case window "+(CASE_FROM||"…")+" .. "+(CASE_TO||"…")+" — prefilled the date filter (filter only, never scored)");
+  if(from){ if(/^\d{4}-\d{2}-\d{2}$/.test(from)) CASE_FROM=from; else appendLog("CLI: ignoring invalid /from value '"+from+"'"); }
+  if(to){ if(/^\d{4}-\d{2}-\d{2}$/.test(to)) CASE_TO=to; else appendLog("CLI: ignoring invalid /to value '"+to+"'"); }
+  if(CASE_FROM||CASE_TO) appendLog("CLI: case window "+(CASE_FROM||"...")+" .. "+(CASE_TO||"...")+" - rows changed inside it are marked (not filtered; never scored)");
 }
 function parseCli(){ var toks=tokenizeCmdTail(), cli={input:"",outDir:"",auto:false,from:"",to:""};
   for(var i=0;i<toks.length;i++){ var t=toks[i];
@@ -2441,7 +2491,7 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
     <ul>
       <li><code>&lt;input&gt;</code> &mdash; a <code>.csv</code> (auto-loads into the viewer) or a host folder / Tasks folder / task file (prefilled; processed with <code>/auto</code>).</li>
       <li><code>&lt;outDir&gt;</code> &mdash; CSV output directory (optional). &nbsp; <code>/auto</code> &mdash; process immediately (downloads RECmd first if it is missing and the web is reachable).</li>
-      <li><code>/from:yyyy-MM-dd</code> <code>/to:yyyy-MM-dd</code> &mdash; case window (UTC, inclusive): prefills the date filter and is recorded in runinfo; never affects scoring.</li>
+      <li><code>/from:yyyy-MM-dd</code> <code>/to:yyyy-MM-dd</code> &mdash; case window (UTC, inclusive): tasks changed inside it are marked <b>in window</b> and counted in a chip beside the date boxes (click <b>filter to it</b> to apply it as a filter); recorded in runinfo; never affects scoring. Unlike the other wrappers it does <b>not</b> pre-filter the list &mdash; a task that matters is often created long before the window.</li>
       <li><b>Target hostname</b> is required before processing &mdash; it names the output folder <code>_Processed\&lt;host&gt;\SchedTasks</code> next to this app (family convention shared with the Artifact-Finder). It is guessed from <code>Collection-&lt;host&gt;-&hellip;</code> paths or a passed <code>_Processed\&lt;host&gt;\</code> outDir &mdash; overwrite the guess if it's wrong.</li>
       <li><b>Shared IOC list</b>: an <code>IOC.txt</code> next to this app (one term per line, <code>#</code> comments) is auto-merged into the IOC box at launch &mdash; one list covers the whole toolkit. Terms you paste locally are kept.</li>
       <li>After every successful run a <code>runinfo.json</code> provenance entry (app, host, input path, files) is appended in the output folder, including a <b>triage summary</b> (entries, flagged count, max score, top hits) &mdash; the Artifact-Finder shows these per host in its inventory. RECmd's raw TaskCache CSVs are kept in a <code>TaskCache\</code> subfolder.</li>
@@ -2451,7 +2501,7 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
       <li><b>T1 IOC</b> +3 &middot; <b>T2 LOLBIN</b> +2 (script host / LOLBin launcher) &middot; <b>T3 CRADLE</b> +2 (IEX, download cradle, encoded command, hidden window) &middot; <b>T4 REMOTE</b> +2 (URL or UNC share) &middot; <b>T5 USERPATH</b> +2 (AppData, Temp, Public, ProgramData, Tasks folders&hellip;)</li>
       <li>Non-Microsoft tasks only: <b>T6 SYSTEM</b> +1 (SYSTEM / highest privileges) &middot; <b>T7 S4U / PASSWORD</b> +1 &middot; <b>T9 HIDDEN</b> +1, <b>BEACON</b> +1 (repeats every &le; 15 min). <b>T8 ONESHOT</b> +1 (single time trigger ending within 24 h, or delete-after-expiry &mdash; the remote-push shape).</li>
       <li>Structure: <b>T10 MALFORMED / NOTTASK</b> +2, <b>NOTUTF16</b> +1, <b>WOW64</b> +2 (file under SysWOW64\Tasks), <b>ATJOB</b> +2 / <b>JOB</b> +1 (legacy <code>.job</code>).</li>
-      <li>TaskCache: <b>NOSD</b> +3 (Tree key without its SD value &mdash; hidden from schtasks and the UI, the Tarrask technique) &middot; <b>REGONLY</b> +2 (registered, no XML on disk) &middot; <b>TREEONLY</b> +3 (a non-Microsoft Tree entry left behind with no Tasks key and no XML &mdash; residue of a task removed outside a normal delete; Microsoft leftovers of that shape are tagged STALE at +0) &middot; <b>XMLONLY</b> +1 (XML not registered) &middot; <b>REGDELETED</b> +1 (deleted task recovered from hive slack, with its actions decoded) &middot; <b>ACTMISMATCH</b> +2 (registry copy of the actions differs from the XML).</li>
+      <li>TaskCache: <b>NOSD</b> +3 (Tree key without its SD value &mdash; hidden from schtasks and the UI, the Tarrask technique; when <i>most</i> of a host's entries lack an SD that is a data problem, so the check is skipped for that host, tagged SD-UNKNOWN and explained in a banner) &middot; <b>REGONLY</b> +2 (registered, no XML on disk) &middot; <b>TREEONLY</b> +3 (a non-Microsoft Tree entry left behind with no Tasks key and no XML &mdash; residue of a task removed outside a normal delete; Microsoft leftovers of that shape are tagged STALE at +0) &middot; <b>XMLONLY</b> +1 (XML not registered) &middot; <b>REGDELETED</b> +1 (deleted task recovered from hive slack, with its actions decoded) &middot; <b>ACTMISMATCH</b> +2 (registry copy of the actions differs from the XML).</li>
       <li>Tasks under <code>\Microsoft\</code> score <b>half</b> on T2 and T5 (Windows ships many script-host tasks there) but are <b>never exempt</b> &mdash; attackers hide tasks in that tree. Context tags at +0: MULTI, COM, DISABLED, ACCT-AUTHOR, URIMISMATCH, STALE.</li>
     </ul>
     <h3>Notes</h3>
