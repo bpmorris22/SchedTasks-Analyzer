@@ -20,7 +20,8 @@
 <!--
   SchedTasks-Analyzer - Windows scheduled-task triage (persistence / lateral movement). Family member
   of the DFIR-Artifact-Finder toolkit. No external parser for the task XML: this app parses it itself
-  (MSXML6). RECmd is used ONLY for the optional TaskCache registry cross-check.
+  (MSXML6). RECmd is used ONLY for the optional TaskCache registry cross-check (current hive + RegBack copy);
+  the optional event-log correlation uses Windows' own wevtutil.
 
   Contracts VERIFIED 2026-10-03 against 17 Velociraptor collections (3,084 task files) + RECmd 2.0.0.0, and
   re-checked 2026-10-04 against RECmd 2026.5.0 (identical batch output; its plugin CSV adds Command,
@@ -45,6 +46,28 @@
       magic - 0x6666 Exec: id, command, arguments, workdir (each u32 len + UTF-16), v3 adds a u16
       trailer; 0x7777 ComHandler: id, 16-byte CLSID, data; 0x8888 SendEmail / 0x9999 ShowMessage.
     Stale Microsoft Tree leaves (Index 0, no Tasks key, no XML) are normal upgrade leftovers.
+    Category TaskCachePath / TaskCacheDyn (v0.2.0) -> Tasks\{GUID}\Path and \DynamicInfo (dashed hex). The batch,
+      not the plugin, is the primary source of the GUID -> path map and the times: RECmd's TaskCache plugin
+      throws "Index was out of range" on the Windows 7 / Server 2008 R2 layout and writes NO plugin CSV.
+    DynamicInfo (VERIFIED 2026-10-04: identical to the plugin's output for 423 tasks on Server 2016 + Win10):
+      u32 version, FILETIME created @4, last start @12, u32 task state @20, i32 last action result @24,
+      FILETIME last stop @28 - 36 bytes on Windows 8+, 28 bytes (no last stop) on Windows 7 / 2008 R2.
+    Windows 7 / 2008 R2 TaskCache has no Actions value in Tasks\{GUID} and no SD value in Tree keys.
+    A deleted Tree key recovered from hive slack can carry no values at all (Id lost) - a valueless deleted
+      key with no child keys is kept as a deleted task, not discarded as a folder.
+    RegBack\SOFTWARE (Server 2008 R2 - 2016 and Windows < 10 1803 keep a populated copy, refreshed every
+      ~10 days by the RegIdleBackup task) is swept the same way: a task removed after that backup can still
+      be registered (or recoverable from slack) there.
+
+  Event logs (v0.2.0) - native wevtutil, no PowerShell:
+    wevtutil qe "<evtx>" /lf:true /q:"*[System[(EventID=...)]]" /f:xml /e:Events > out.xml
+    writes UTF-8 (no BOM) when redirected, one <Events> root; ~0.3 s for a full 10 MB TaskScheduler log, 1.5 s
+    to filter an 879 MB Security log. (Get-WinEvent + ToXml took 130-250 s for the same logs.)
+    Velociraptor stores the log as Microsoft-Windows-TaskScheduler%254Operational.evtx (double-encoded).
+    TaskScheduler/Operational EventData names: 100/102/110 TaskName, UserContext, InstanceId; 101 + ResultCode;
+    106 TaskName, UserContext; 129 TaskName, Path, ProcessID; 140/141/142 TaskName, UserName; 200 TaskName,
+    ActionName, TaskInstanceId; 201/202/203 + ResultCode. Security 4698-4702: Subject*, TaskName, TaskContent
+    (4702: TaskContentNew) - the full task XML, parsed like a task file when no XML survives.
 
   Times: files extracted from a Velociraptor offline-collector ZIP carry the ANALYSIS box's timezone
     error (DOS zip times; seen -10:00 on a UTC+10 box). The collection's own
@@ -136,6 +159,12 @@
   .xml{font-family:Consolas,"Courier New",monospace;font-size:11px;white-space:pre;max-height:340px;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px;margin:4px 0;width:100%;box-sizing:border-box}
   .warnbar{background:#2a2410;border:1px solid #8a7a2a;color:#e3b341;border-radius:6px;padding:6px 10px;font-size:12px;margin-bottom:8px}
   .dsec{margin:8px 0 2px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e}
+  .infobar{background:#0f1d30;border:1px solid #1f4f8f;color:#9ecbff;border-radius:6px;padding:6px 10px;font-size:12px;margin-bottom:8px}
+  .tag.evt{background:#2a1f3a;color:#d2a8ff}
+  table.evl{width:100%;border-collapse:collapse;font-size:11px;margin:4px 0}
+  table.evl td{padding:2px 6px;border-bottom:1px solid #21262d;max-width:none;white-space:nowrap}
+  table.evl tr.del td{color:#ff9b9b}
+  .evscroll{max-height:260px;overflow:auto;border:1px solid #30363d;border-radius:6px;width:100%;box-sizing:border-box}
 </style>
 </head>
 <body>
@@ -169,7 +198,10 @@
     <button class="btn" id="liveBtn" title="Point at this machine's own Tasks folder. Reading it needs an elevated (Run as administrator) mshta. The live SOFTWARE hive is locked by Windows, so the TaskCache cross-check is skipped for live runs.">This machine</button>
     <label class="fld" title="Normally leave this blank: for every Tasks folder found, the app looks for ..\System32\config\SOFTWARE in the same collection and copies it (with its .LOG1/.LOG2) to %TEMP% for RECmd. Type a hive path here only to override that for a single-root run.">SOFTWARE hive for the TaskCache cross-check &mdash; found automatically beside each Tasks folder; type a path only to override it</label>
     <input class="txt wide" id="hivePath" value="" placeholder="(automatic)">
-    <label class="muted" style="font-size:12px" title="Reads the SOFTWARE hive's TaskCache keys with RECmd: registered tasks with no XML, XML with no registration, deleted tasks recovered from the hive, hidden tasks with their SD removed, created / last-run times, and the registry copy of each task's actions."><input type="checkbox" id="optTc" checked> TaskCache cross-check (needs RECmd)</label>
+    <div style="margin-top:6px">
+    <label class="muted" style="font-size:12px" title="Reads the SOFTWARE hive's TaskCache keys with RECmd: registered tasks with no XML, XML with no registration, deleted tasks recovered from the hive, hidden tasks with their SD removed, created / last-run times, and the registry copy of each task's actions. Where the collection holds a populated RegBack\SOFTWARE copy, it is swept too: tasks removed after that backup show up as RegBack-only or recovered rows."><input type="checkbox" id="optTc" checked> TaskCache cross-check (needs RECmd; includes the RegBack copy)</label>
+    <label class="muted" style="font-size:12px;margin-left:14px" title="Reads the collection's Microsoft-Windows-TaskScheduler/Operational log (registered 106, updated 140, deleted 141, runs 100 / 129 / 200) and Security 4698-4702 with Windows' own wevtutil. A task that was registered, run and deleted leaves no XML and often no registry key - only these events. Each task gets its lifecycle, run count and the images it actually launched; tasks known only from the log get their own rows."><input type="checkbox" id="optEvt" checked> Event-log correlation (TaskScheduler/Operational + Security 4698-4702)</label>
+    </div>
     <label class="fld" title="Required before processing. Guessed from the input path (Collection-&lt;host&gt;-... segments, a _Processed\&lt;host&gt;\ outDir, or this machine for live paths) - overwrite it if the guess is wrong.">Target hostname (required) &mdash; names the output folder _Processed\&lt;host&gt;\SchedTasks next to this app</label>
     <input class="txt" id="hostName" value="" style="width:260px" placeholder="e.g. WORKSTATION-01">
     <label class="fld">CSV output directory</label>
@@ -200,6 +232,7 @@
       <h3 id="ovTitle">Overview</h3>
       <div id="skewWarn" class="warnbar hide"></div>
       <div id="sdWarn" class="warnbar hide"></div>
+      <div id="evtNote" class="infobar hide"></div>
       <div id="statbar"></div>
     </div>
 
@@ -225,7 +258,8 @@
         <button class="btn" data-cat="com">COM handler</button>
         <button class="btn" data-cat="hidden">Hidden</button>
         <button class="btn" data-cat="disabled">Disabled</button>
-        <button class="btn" data-cat="reg" title="TaskCache findings: no SD (hidden task), registered without XML, Tree residue of a removed task, XML without registration, deleted task recovered from the hive, registry actions differ from the XML">Registry anomalies</button>
+        <button class="btn" data-cat="reg" title="TaskCache findings: no SD (hidden task), registered without XML, Tree residue of a removed task, XML without registration, deleted task recovered from the hive, registered only in the RegBack copy, registry actions differ from the XML">Registry anomalies</button>
+        <button class="btn" data-cat="evt" title="Event-log findings: tasks the TaskScheduler / Security log shows as deleted (and nothing is left on disk or in the hive), deleted within minutes of being registered or run, or known only from the log">Event-log findings</button>
       </div>
       <div style="margin-bottom:8px;line-height:2.4">   <!-- wraps (unlike .row): the filter set is wider than a 1500px window -->
         <input class="txt" id="q" placeholder="search all columns&hellip;" style="width:250px">
@@ -262,7 +296,7 @@
         <span class="muted" id="iocInfo" style="font-size:11px"></span>
       </div>
       <div class="scroll" id="tblScroll"><table id="tbl"></table></div>
-      <div class="muted" id="pfFoot" style="font-size:11px;margin-top:6px">Changed (UTC) comes from the collection's own file metadata when present (vr), else the TaskCache Tree key (reg), else the extracted file time (file - can carry the unzip box's timezone error). Flagged rows are shaded (heuristic score &ge; 3 &mdash; see Help for the T1&ndash;T14 rules). Tasks under \Microsoft\ score half for LOLBin and user-path rules but are never exempt. Click a row for full detail; click a Run-as cell to filter to that account. Max 6000 rows shown; export writes the full filtered set.</div>
+      <div class="muted" id="pfFoot" style="font-size:11px;margin-top:6px">Changed (UTC) comes from the collection's own file metadata when present (vr), else - for a task that is gone - when the event log saw it deleted (evt), else the TaskCache Tree key (reg), else the extracted file time (file - can carry the unzip box's timezone error). Flagged rows are shaded (heuristic score &ge; 3 &mdash; see Help for the T1&ndash;T17 rules). Tasks under \Microsoft\ score half for LOLBin and user-path rules but are never exempt. Click a row for full detail; click a Run-as cell to filter to that account. Max 6000 rows shown; export writes the full filtered set.</div>
     </div>
 
     <div class="card hide" id="detailCard">
@@ -276,7 +310,7 @@
 <script language="JScript">
 "use strict";
 
-var APP_VERSION = "0.1.1";
+var APP_VERSION = "0.2.0";
 var KNOWN_LATEST_RECMD = "2.0.0.0";                                            // baseline 2026-10-03 (C:\ZimmermanTools copy)
 var RECMD_ZIP_URL = "https://download.ericzimmermanstools.com/RECmd.zip";      // official EZ mirror (folder-shaped: exe + Plugins + BatchExamples)
 var RECMD_PAGE = "https://ericzimmerman.github.io/";                           // for live latest-version lookup
@@ -321,7 +355,7 @@ var PRODUCED = [];                   // CSVs produced by the last run
 var XMLTEXT = {};                    // lowercased SourceFile -> raw task XML (this session's runs only, 64 KB cap each)
 var RUN = null;                      // state of the run in progress
 
-/* suspicion knobs (spec section 7, T1-T14; flagged = score >= 3) */
+/* suspicion knobs (spec section 7, T1-T17; flagged = score >= 3) */
 var SUS_MIN = 3;
 /* T2 launchers: script hosts and living-off-the-land binaries */
 var LOLBINS = {powershell:1,pwsh:1,cmd:1,mshta:1,wscript:1,cscript:1,rundll32:1,regsvr32:1,msiexec:1,certutil:1,
@@ -601,8 +635,8 @@ function updateVerPill(){
 }
 function evaluateTooling(){
   var found=resolveExe();
-  if(found) $("exeline").innerHTML="Engine: built-in task XML parser (MSXML6) &middot; TaskCache cross-check via "+esc(EXE)+(RECMD_PLUGIN?"":" (no TaskCache plugin - times unavailable)");
-  else $("exeline").innerHTML='Engine: built-in task XML parser (MSXML6) &middot; <span class="err">RECmd not found</span> &mdash; the TaskCache cross-check is skipped until you use Download RECmd (task XML triage is unaffected)';
+  if(found) $("exeline").innerHTML="Engine: built-in task XML parser (MSXML6) &middot; event logs via wevtutil &middot; TaskCache cross-check via "+esc(EXE)+(RECMD_PLUGIN?"":" (no TaskCache plugin - times unavailable)");
+  else $("exeline").innerHTML='Engine: built-in task XML parser (MSXML6) &middot; event logs via wevtutil &middot; <span class="err">RECmd not found</span> &mdash; the TaskCache cross-check is skipped until you use Download RECmd (task XML triage is unaffected)';
   if(found) checkVersion(true); else LOCAL_VER="";
   fetchLatest(); updateVerPill();
 }
@@ -780,8 +814,24 @@ var CSVCOLS=["TaskPath","Enabled","Hidden","Author","RunAs","LogonType","RunLeve
   "TriggerTypes","TriggerSummary","StartBoundary","EndBoundary","MinRepetition","DeleteExpired","RegDate",
   "ChangedUtc","ChangedSource","FileCreatedUtc","FileModifiedUtc","FileTimeSource","ExtractedModifiedUtc",
   "FileSize","RegStatus","RegGuid","RegCreatedUtc","RegLastStartUtc","RegLastStopUtc","RegLastResult",
-  "RegTaskState","TreeLastWriteUtc","TreeIndex","TreeSD","RegActions","RegActionCommands","Description",
-  "Source","Uri","XmlVersion","SecurityDescriptor","ParseStatus","TasksRoot","SourceFile"];
+  "RegTaskState","TreeLastWriteUtc","TreeIndex","TreeSD","RegActions","RegActionCommands",
+  "RegBackStatus","RegBackUtc","EvtStatus","EvtRegisteredUtc","EvtRegisteredBy","EvtUpdatedUtc","EvtDeletedUtc",
+  "EvtDeletedBy","EvtDeleteGapSecs","EvtSelfDeleteGapSecs","EvtRuns","EvtFirstRunUtc","EvtLastRunUtc","EvtActions","EvtEvents","EvtDefinition",
+  "Description","Source","Uri","XmlVersion","SecurityDescriptor","ParseStatus","TasksRoot","SourceFile"];
+/* companion CSV: one row per Task Scheduler event (TaskScheduler/Operational + Security 4698-4702) */
+var EVTCOLS=["TimeUtc","EventId","Meaning","Log","TaskName","User","Action","InstanceId","ProcessId","ResultCode",
+  "RecordId","WinDir","SourceLog","TaskContent"];
+var EVT_TS_IDS=[100,101,102,103,106,110,111,129,140,141,142,200,201,202,203];
+var EVT_SEC_IDS=[4698,4699,4700,4701,4702];
+var EVT_MEANING={100:"Task started",101:"Task start failed",102:"Task completed",103:"Action start failed",106:"Task registered",
+  110:"Task triggered by user",111:"Task terminated",129:"Task process created",140:"Task updated",141:"Task deleted",
+  142:"Task disabled",200:"Action started",201:"Action completed",202:"Action failed",203:"Action failed to start",
+  4698:"Task created (Security)",4699:"Task deleted (Security)",4700:"Task enabled (Security)",4701:"Task disabled (Security)",
+  4702:"Task updated (Security)"};
+var EVT_SEC_MAX=2147483648;          // Security.evtx above 2 GB is not staged / queried (say so; Hayabusa-Wrapper covers it)
+var QUICKDEL_SECS=600;               // T16: registered (or updated), run and deleted within 10 min - fleet-tuned 2026-10-04: Windows Update
+                                     // deletes tasks right after an update with no run; Windows 11 SoftLanding tasks self-delete during a run hours
+                                     // after registration; a real remote-execution task was registered, run and deleted in 0.15 s
 var TC_REB=[
   "Description: SchedTasks-Analyzer TaskCache sweep",
   "Author: SchedTasks-Analyzer",
@@ -810,7 +860,24 @@ var TC_REB=[
   "        ValueName: Actions",
   "        IncludeBinary: true",
   "        Recursive: false",
-  "        Comment: \"registry copy of each task's actions\""
+  "        Comment: \"registry copy of each task's actions\"",
+  "    -",
+  "        Description: TaskCache Task paths",
+  "        HiveType: Software",
+  "        Category: TaskCachePath",
+  "        KeyPath: Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\\*",
+  "        ValueName: Path",
+  "        Recursive: false",
+  "        Comment: \"GUID -> task path (the plugin's own source; read here because the plugin fails on Windows 7 hives)\"",
+  "    -",
+  "        Description: TaskCache DynamicInfo",
+  "        HiveType: Software",
+  "        Category: TaskCacheDyn",
+  "        KeyPath: Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\\*",
+  "        ValueName: DynamicInfo",
+  "        IncludeBinary: true",
+  "        Recursive: false",
+  "        Comment: \"created / last start / state / last result / last stop\""
 ].join("\r\n")+"\r\n";
 
 function utcStamp(){ var d=new Date(); function p(x){ return (x<10?"0":"")+x; }
@@ -831,6 +898,18 @@ function rootKind(pL){
 function windowsDirOf(p){ var m=String(p).match(/^(.*\\windows)\\(system32|sysnative|syswow64|tasks)(\\|$)/i); return m?m[1]:""; }
 function collectionDirOf(p){ var i=String(p).toLowerCase().indexOf("\\uploads\\"); return i>0?String(p).substring(0,i):""; }
 function hiveFor(rootPath){ var w=windowsDirOf(rootPath); if(!w) return ""; var h=w+"\\System32\\config\\SOFTWARE"; return fileExists(h)?h:""; }
+function fileSize(p){ try{ return new ActiveXObject("Scripting.FileSystemObject").GetFile(p).Size-0; }catch(e){ return -1; } }
+/* the RegBack copy beside a hive - populated on Server 2008 R2 - 2016 / Windows < 10 1803, 0 bytes after that */
+function regBackFor(hv){ var p=parentDir(hv)+"\\RegBack\\"+baseName(hv); return fileSize(p)>4096?p:""; }
+/* the collection's event logs: Velociraptor double-encodes the %4 in the channel file name */
+function evtLogsFor(rootPath){
+  var w=windowsDirOf(rootPath); if(!w) return null;
+  var d=w+"\\System32\\winevt\\Logs", o={dir:d, ts:"", sec:"", secSize:0}, n=["Microsoft-Windows-TaskScheduler%254Operational.evtx","Microsoft-Windows-TaskScheduler%4Operational.evtx"];
+  for(var i=0;i<n.length;i++){ if(fileExists(d+"\\"+n[i])){ o.ts=n[i]; break; } }
+  if(fileExists(d+"\\Security.evtx")){ o.sec="Security.evtx"; o.secSize=fileSize(d+"\\Security.evtx"); }
+  return (o.ts||o.sec)?o:null; }
+function evtQuery(ids){ var p=[]; for(var i=0;i<ids.length;i++) p.push("EventID="+ids[i]); return "*[System[("+p.join(" or ")+")]]"; }
+function winKey(root){ return String(windowsDirOf(root.path)||root.path).toLowerCase(); }
 function isLiveSystemPath(p){ try{ var w=String(new ActiveXObject("WScript.Shell").ExpandEnvironmentStrings("%WINDIR%")).toLowerCase();
   return String(p).toLowerCase().indexOf(w+"\\")===0; }catch(e){ return false; } }
 function isVrTree(p){ return /%3a/i.test(String(p)) || String(p).toLowerCase().indexOf("\\uploads\\")>=0; }
@@ -948,16 +1027,65 @@ function stageRoots(){
     lines.push('robocopy "'+batEsc(parentDir(hv))+'" "'+batEsc(r.hiveStage)+'" "'+batEsc(hb)+'" "'+batEsc(hb)+'.LOG1" "'+batEsc(hb)+'.LOG2"'+robo);
     lines.push('>> "__LOG__" echo HIVE '+n+' %ERRORLEVEL%');
     var rc='"'+batEsc(EXE)+'" -f "'+batEsc(r.hiveStage+"\\"+hb)+'" --bn "'+batEsc(R.stage+"\\SchedTasks_TaskCache.reb")+'" --csv "'+batEsc(r.tcDir)+'"';
+    lines.push('>> "__LOG__" echo RECMDRUN '+n+' main');
     lines.push(rc+' >> "__LOG__" 2>&1');
     // dirty hive with no usable transaction logs -> RECmd aborts with no CSV: retry once without log replay
     lines.push('if not exist "'+batEsc(r.tcDir)+'\\*_RECmd_Batch_*.csv" ( >> "__LOG__" echo NLRETRY '+n+' & '+rc+' --nl >> "__LOG__" 2>&1 )');
+    // the RegBack copy (B, v0.2.0): a task removed after the last backup can still be registered - or sit in slack - there
+    var rbh=(manualHive && R.roots.length===1)?"":regBackFor(hv);
+    if(rbh){ r.rbHive=rbh; r.rbStage=R.stage+"\\hb"+n; r.rbTcDir=R.stage+"\\tb"+n;
+      lines.push("echo RECmd TaskCache sweep of the RegBack copy - root "+n+" ...");
+      lines.push('robocopy "'+batEsc(parentDir(rbh))+'" "'+batEsc(r.rbStage)+'" "'+batEsc(hb)+'" "'+batEsc(hb)+'.LOG1" "'+batEsc(hb)+'.LOG2"'+robo);
+      lines.push('>> "__LOG__" echo RBHIVE '+n+' %ERRORLEVEL%');
+      var rc2='"'+batEsc(EXE)+'" -f "'+batEsc(r.rbStage+"\\"+hb)+'" --bn "'+batEsc(R.stage+"\\SchedTasks_TaskCache.reb")+'" --csv "'+batEsc(r.rbTcDir)+'"';
+      lines.push('>> "__LOG__" echo RECMDRUN '+n+' regback');
+      lines.push(rc2+' >> "__LOG__" 2>&1');
+      lines.push('if not exist "'+batEsc(r.rbTcDir)+'\\*_RECmd_Batch_*.csv" ( >> "__LOG__" echo RBNLRETRY '+n+' & '+rc2+' --nl >> "__LOG__" 2>&1 )'); }
+  }
+  // event logs (A, v0.2.0): one query per collection (System32\Tasks + SysWOW64\Tasks + Windows\Tasks share one Windows dir)
+  var useEvt=$("optEvt").checked, evtOwner={}, anyEvt=false;
+  for(i=0;useEvt && i<R.roots.length;i++){ var re=R.roots[i], en=re.n;
+    if(re.kind==="flat" || re.kind==="file") continue;
+    var wk=winKey(re);
+    if(evtOwner[wk]){ re.evtShare=evtOwner[wk]; continue; }
+    re.evtXml=[];
+    if(isLiveSystemPath(re.path)){
+      evtOwner[wk]=re; anyEvt=true; re.evtLive=true;
+      lines.push("echo Event logs (this machine) - root "+en+" ...");
+      re.evtXml.push({log:"TaskScheduler", f:R.stage+"\\ev"+en+"_ts.xml", src:"Microsoft-Windows-TaskScheduler/Operational"});
+      re.evtXml.push({log:"Security", f:R.stage+"\\ev"+en+"_sec.xml", src:"Security"});
+      lines.push('wevtutil qe "Microsoft-Windows-TaskScheduler/Operational" /q:"'+evtQuery(EVT_TS_IDS)+'" /f:xml /e:Events > "'+batEsc(re.evtXml[0].f)+'" 2>> "__LOG__"');
+      lines.push('>> "__LOG__" echo EVTQ '+en+' TaskScheduler %ERRORLEVEL%');
+      lines.push('wevtutil qe "Security" /q:"'+evtQuery(EVT_SEC_IDS)+'" /f:xml /e:Events > "'+batEsc(re.evtXml[1].f)+'" 2>> "__LOG__"');
+      lines.push('>> "__LOG__" echo EVTQ '+en+' Security %ERRORLEVEL%');
+      continue; }
+    var lg=evtLogsFor(re.path);
+    if(!lg){ re.evtNote="no TaskScheduler/Operational or Security.evtx under "+(windowsDirOf(re.path)||re.path)+"\\System32\\winevt\\Logs"; continue; }
+    evtOwner[wk]=re; anyEvt=true;
+    var ed=R.stage+"\\ev"+en, cp=[];
+    if(lg.ts) cp.push(lg.ts);
+    if(lg.sec){ if(lg.secSize>EVT_SEC_MAX) R.warn.push("Security.evtx for root "+en+" is "+fmtSize(lg.secSize)+" - not queried for 4698-4702 (over the "+fmtSize(EVT_SEC_MAX)+" cap); run Hayabusa-Wrapper on it."); else cp.push(lg.sec); }
+    if(!cp.length) continue;
+    lines.push("echo Event logs - root "+en+" of "+R.roots.length+" ...");
+    var cpq=[]; for(var ci=0;ci<cp.length;ci++) cpq.push('"'+batEsc(cp[ci])+'"');
+    lines.push('robocopy "'+batEsc(lg.dir)+'" "'+batEsc(ed)+'" '+cpq.join(" ")+robo);
+    lines.push('>> "__LOG__" echo EVROBO '+en+' %ERRORLEVEL%');
+    for(ci=0;ci<cp.length;ci++){ var isTs=(cp[ci]===lg.ts), lab=isTs?"TaskScheduler":"Security", pre=R.stage+"\\ev"+en+(isTs?"_ts":"_sec"), sf=ed+"\\"+cp[ci];
+      re.evtXml.push({log:lab, f:pre+".xml", old:pre+"_old.xml", nw:pre+"_new.xml", src:lg.dir+"\\"+cp[ci]});
+      lines.push('wevtutil qe "'+batEsc(sf)+'" /lf:true /q:"'+evtQuery(isTs?EVT_TS_IDS:EVT_SEC_IDS)+'" /f:xml /e:Events > "'+batEsc(pre)+'.xml" 2>> "__LOG__"');
+      lines.push('>> "__LOG__" echo EVTQ '+en+' '+lab+' %ERRORLEVEL%');
+      // log coverage (oldest / newest record of the WHOLE log): a task missing from a short log proves nothing
+      lines.push('wevtutil qe "'+batEsc(sf)+'" /lf:true /c:1 /rd:false /f:xml > "'+batEsc(pre)+'_old.xml" 2> nul');
+      lines.push('wevtutil qe "'+batEsc(sf)+'" /lf:true /c:1 /rd:true /f:xml > "'+batEsc(pre)+'_new.xml" 2> nul'); }
   }
   if(anyHive){ try{ var f=fso.CreateTextFile(R.stage+"\\SchedTasks_TaskCache.reb",true,false); f.Write(TC_REB); f.Close(); }
     catch(e3){ appendLog("Could not write the RECmd batch file: "+e3.message); } }
-  appendLog("Staging "+R.roots.length+" root(s) to "+R.stage+(anyHive?" + RECmd TaskCache sweep ("+EXE+")":""));
-  for(i=0;i<R.roots.length;i++) appendLog("  root "+R.roots[i].n+": "+R.roots[i].path+(R.roots[i].hive?("  [hive "+R.roots[i].hive+"]"):(R.roots[i].hiveNote?("  ["+R.roots[i].hiveNote+"]"):"")));
+  appendLog("Staging "+R.roots.length+" root(s) to "+R.stage+(anyHive?" + RECmd TaskCache sweep ("+EXE+")":"")+(anyEvt?" + event logs (wevtutil)":""));
+  for(i=0;i<R.roots.length;i++){ var lr=R.roots[i];
+    appendLog("  root "+lr.n+": "+lr.path+(lr.hive?("  [hive "+lr.hive+"]"):(lr.hiveNote?("  ["+lr.hiveNote+"]"):""))+(lr.rbHive?("  [+ RegBack "+lr.rbHive+"]"):"")
+      +(lr.evtXml&&lr.evtXml.length?("  [event logs: "+(lr.evtLive?"this machine":lr.evtXml.length+" file(s)")+"]"):(lr.evtNote?("  ["+lr.evtNote+"]"):""))); }
   var ctx=runBatAsync(lines, true);
-  ctx.onTick=function(s){ setStatus("Staging"+(anyHive?" + RECmd TaskCache sweep":"")+"... "+s+"s elapsed (app responsive; results load when done)","muted"); };
+  ctx.onTick=function(s){ setStatus("Staging"+(anyHive?" + RECmd TaskCache sweep":"")+(anyEvt?" + event logs":"")+"... "+s+"s elapsed (app responsive; results load when done)","muted"); };
   ctx.onTimeout=function(){ runFail("Staging / RECmd did not finish within 30 minutes - check the console window."); };
   ctx.onDone=function(log){ R.stageLog=log||""; afterStage(); };
   window.setTimeout(function(){ pollDone(ctx); },1000);
@@ -971,7 +1099,11 @@ function afterStage(){
     if(r.robo>=8) R.warn.push("robocopy could not copy all of root "+r.n+" (exit "+r.robo+")"+(isLiveSystemPath(r.path)?" - a live Tasks folder needs an elevated run":"")+": "+r.path);
     if(r.hive && !r.shareWith){ var hc=logCode(log,"HIVE",r.n);
       if(hc>=8 || hc<0){ R.warn.push("Could not copy the SOFTWARE hive for root "+r.n+" (exit "+hc+") - cross-check skipped for it."); r.hive=""; }
-      if(log.indexOf("NLRETRY "+r.n)>=0){ r.tcNl=true; R.warn.push("Root "+r.n+": dirty hive with no usable transaction logs - RECmd re-ran without log replay (recent registry changes may be missing)."); } }
+      if(log.indexOf("\nNLRETRY "+r.n)>=0){ r.tcNl=true; R.warn.push("Root "+r.n+": dirty hive with no usable transaction logs - RECmd re-ran without log replay (recent registry changes may be missing)."); } }
+    if(r.rbHive){ var rbc=logCode(log,"RBHIVE",r.n);
+      if(rbc>=8 || rbc<0){ R.warn.push("Could not copy the RegBack hive for root "+r.n+" (exit "+rbc+") - RegBack sweep skipped."); r.rbHive=""; } }
+    if(r.evtXml && r.evtXml.length && !r.evtLive){ var evc=logCode(log,"EVROBO",r.n);
+      if(evc>=8 || evc<0){ R.warn.push("Could not copy the event logs for root "+r.n+" (exit "+evc+") - event-log correlation skipped."); r.evtXml=[]; } }
     r.files=[]; walkStage(fso, r.stageDir, "", r, r.files, 0);
     for(var j=0;j<r.files.length;j++) R.files.push(r.files[j]);
   }
@@ -979,11 +1111,12 @@ function afterStage(){
     // an EMPTY Tasks folder with a populated TaskCache is exactly the wiped-XML case the cross-check exists for:
     // carry on to the registry join whenever any root's RECmd sweep left a batch CSV
     var tcOk=false;
-    for(i=0;i<R.roots.length;i++){ var rr=R.roots[i]; if(rr.hive && !rr.shareWith && rr.tcDir && newestFile(rr.tcDir, /_RECmd_Batch_.*\.csv$/i, false)) tcOk=true; }
+    for(i=0;i<R.roots.length;i++){ var rr=R.roots[i]; if(rr.hive && !rr.shareWith && rr.tcDir && newestFile(rr.tcDir, /_RECmd_Batch_.*\.csv$/i, false)) tcOk=true;
+      if(rr.evtXml && rr.evtXml.length) tcOk=true; }                     // the event log alone can still name deleted tasks
     if(!tcOk){
       runFail("No task files were staged from the input"+(R.warn.length?(" - "+R.warn.join(" ")):" - check that the folder holds a Windows\\System32\\Tasks tree or task XML files."));
       return; }
-    R.warn.push("No task XML files were staged - showing the TaskCache registry view only.");
+    R.warn.push("No task XML files were staged - showing the TaskCache registry / event-log view only.");
   }
   R.pi=0;
   setStatus("Parsing "+nf(R.files.length)+" task file(s)...","muted");
@@ -1008,7 +1141,9 @@ function parseBatch(){
     catch(e){ var b=blankRow(f); b.ParseStatus="unreadable"; R.rows.push(b); appendLog("Unreadable: "+f.rel+" - "+e.message); } }
   setStatus("Parsing task files... "+nf(R.pi)+" / "+nf(R.files.length),"muted");
   if(R.pi<R.files.length){ window.setTimeout(parseBatch, 1); return; }
-  window.setTimeout(joinAndWrite, 10);
+  R.evQ=[]; for(var i=0;i<R.roots.length;i++){ var r=R.roots[i]; if(r.evtXml && r.evtXml.length) R.evQ.push(r); }
+  R.evCur=null;
+  window.setTimeout(parseEvents, 10);
 }
 
 /* ---------- one task file -> one CSV row ---------- */
@@ -1076,17 +1211,26 @@ function parseTaskFile(f){
   if(!trimStr(t)){ r.ParseStatus="empty"; return r; }
   if(trimStr(t).charAt(0)!=="<"){ r.ParseStatus="not-task"; return r; }   // not XML at all: something stashed in a Tasks folder
   XMLTEXT[String(r.SourceFile).toLowerCase()]=(t.length>65536)?(t.substring(0,65536)+"\n... (truncated at 64 KB)"):t;
-  var d=newDom(); if(!d){ r.ParseStatus="no-msxml"; return r; }
-  var ok=false; try{ ok=d.loadXML(t.replace(/^\s*<\?xml[^>]*\?>/,"")); }catch(e){ ok=false; }
-  if(!ok || !d.documentElement){ r.ParseStatus="malformed"; regexSalvage(r,t); return r; }
+  var st=parseTaskXmlInto(r, t);
+  if(st==="ok") st=(rd.enc==="utf16")?"ok":"not-utf16";
+  else if(st==="malformed") regexSalvage(r,t);
+  r.ParseStatus=st;
+  if(st!=="malformed" && st!=="not-task" && st!=="no-msxml" && (f.root.kind==="flat" || f.root.kind==="file") && r.Uri) r.TaskPath=(r.Uri.charAt(0)==="\\"?"":"\\")+r.Uri;
+  return r;
+}
+/* task XML text -> the definition columns of r. Shared by task files and Security 4698 / 4702 TaskContent.
+   Returns ok | malformed | not-task | no-msxml. Evidence is attacker-authored: no DTDs, no externals (newDom). */
+function stripBom(s){ s=String(s); return (s.charCodeAt(0)===65279)?s.substring(1):s; }
+function parseTaskXmlInto(r, t){
+  var i, d=newDom(); if(!d) return "no-msxml";
+  var ok=false; try{ ok=d.loadXML(stripBom(t).replace(/^\s*<\?xml[^>]*\?>/,"")); }catch(e){ ok=false; }
+  if(!ok || !d.documentElement) return "malformed";
   var root=d.documentElement;
-  if(nodeName(root).toLowerCase()!=="task"){ r.ParseStatus="not-task"; return r; }
-  r.ParseStatus=(rd.enc==="utf16")?"ok":"not-utf16";
+  if(nodeName(root).toLowerCase()!=="task") return "not-task";
   r.XmlVersion=root.getAttribute("version")||"";
   r.Author=xt(root,"RegistrationInfo/Author"); r.Description=xt(root,"RegistrationInfo/Description");
   r.Uri=xt(root,"RegistrationInfo/URI"); r.RegDate=xt(root,"RegistrationInfo/Date");
   r.Source=xt(root,"RegistrationInfo/Source"); r.SecurityDescriptor=xt(root,"RegistrationInfo/SecurityDescriptor");
-  if((f.root.kind==="flat" || f.root.kind==="file") && r.Uri) r.TaskPath=(r.Uri.charAt(0)==="\\"?"":"\\")+r.Uri;
   // principal: the one Actions/@Context names, else the first
   var actEl=xs(root,"Actions"), ctxId=actEl?(actEl.getAttribute("Context")||""):"";
   var prs=xl(root,"Principals/Principal"), pr=null;
@@ -1117,7 +1261,7 @@ function parseTaskFile(f){
       if(o.t==="Exec"){ r.Command=o.cmd; r.Arguments=o.args; r.WorkingDir=o.wd; }
       else if(o.t==="ComHandler"){ r.ComClassId=o.clsid; r.ComData=o.data; } } }
   r.ActionCount=String(acts.length); r.AllActions=list.join(" || "); r.ActionCommands=cmds.join(" | ");
-  return r;
+  return "ok";
 }
 
 /* ---------- TaskCache Actions blob (registry copy of a task's actions) ----------
@@ -1158,7 +1302,7 @@ function loadVrMeta(root){
     for(; !fe.atEnd(); fe.moveNext()){ var nm=fe.item().Name+""; if(/metadata\.json$/i.test(nm)) files.push(fe.item().Path+""); } }catch(e){ return null; }
   for(i=0;i<files.length;i++){
     var lines; try{ lines=String(readUtf8(files[i])).split("\n"); }catch(e1){ continue; }
-    for(j=0;j<lines.length;j++){ var ln=lines[j]; if(ln.indexOf("Tasks")<0) continue;
+    for(j=0;j<lines.length;j++){ var ln=lines[j]; if(ln.indexOf("Tasks")<0 && ln.indexOf("RegBack")<0) continue;   // + the RegBack hive's own time
       var o; try{ o=JSON.parse(ln); }catch(e2){ continue; }
       var sf=String(o.SourceFile||o.OSPath||o.FullPath||""), k=sf.toLowerCase(), wi=k.indexOf("\\windows\\");
       if(wi<0) continue;
@@ -1182,85 +1326,281 @@ function newestFile(dir, re, recurse){
   walk(dir,0); return best;
 }
 /* provenance: keep RECmd's raw output beside the analyzer CSV, flattened to short names */
-function keepRawTc(root, bf, pf){
+function keepRawTc(root, bf, pf, tag){
   try{ var fso=new ActiveXObject("Scripting.FileSystemObject"), d=root.tcKeep;
     if(!fso.FolderExists(d)) fso.CreateFolder(d);
-    var pre=d+"\\"+RUN.stamp+"_r"+root.n;
-    fso.CopyFile(bf.path, pre+"_RECmd_TaskCache_batch.csv", true);
-    if(pf) fso.CopyFile(pf.path, pre+"_RECmd_TaskCache_plugin.csv", true);
+    var pre=d+"\\"+RUN.stamp+"_r"+root.n+"_RECmd_"+(tag||"TaskCache");
+    lpCopy(fso, bf.path, pre+"_batch.csv");
+    if(pf) lpCopy(fso, pf.path, pre+"_plugin.csv");
   }catch(e){ RUN.warn.push("Could not keep the raw RECmd CSVs for root "+root.n+" in "+root.tcKeep+": "+e.message); }
 }
+/* FSO is not long-path safe, but takes \\?\ paths (see the MAX_PATH notes): retry with the prefix past ~240 chars */
+function lpCopy(fso, src, dst){ try{ fso.CopyFile(src, dst, true); }catch(e){ if(String(dst).length<240 || /^\\\\/.test(dst)) throw e; fso.CopyFile(src, "\\\\?\\"+dst, true); } }
 function headIdx(head){ var idx={}; for(var h=0;h<head.length;h++) idx[trimStr(head[h])]=h; return idx; }
-function loadTaskCache(root){
-  if(!root.hive || !root.tcDir || !folderExists(root.tcDir)) return null;
-  var bf=newestFile(root.tcDir, /_RECmd_Batch_.*\.csv$/i, false), pf=newestFile(root.tcDir, /_TaskCache_.*\.csv$/i, true);
-  if(!bf){ RUN.warn.push("Root "+root.n+": RECmd produced no CSV - cross-check skipped (see log)."); return null; }
-  keepRawTc(root, bf, pf);
-  var tc={all:[], byKey:{}, byGuid:{}, plugin:!!pf, nl:!!root.tcNl}, raw, idx, r, i;
+/* DynamicInfo -> created / last start / state / result / last stop (layout + verification in the header comment) */
+function ftStr(b,o){ if(o+8>b.length) return ""; var lo=rdU32(b,o), hi=rdU32(b,o+4); if(!lo && !hi) return "";
+  var ms=hi*429496.7296+lo/10000-11644473600000; if(ms<=0 || ms>4102444800000) return ""; return msToTs(Math.floor(ms)); }
+function decodeDyn(hex){ var b=hexToBytes(hex); if(!b || b.length<20) return null;
+  var o={created:ftStr(b,4), lastStart:ftStr(b,12), state:"", result:"", lastStop:""};
+  if(b.length>=24) o.state=String(rdU32(b,20));
+  if(b.length>=28){ var v=rdU32(b,24); if(v>=2147483648) v-=4294967296; o.result=String(v); }
+  if(b.length>=36) o.lastStop=ftStr(b,28);
+  return o; }
+/* one RECmd sweep (batch CSV + optional plugin CSV) -> {all, byKey, byGuid, ...}.
+   The batch is the primary source (Tree Id / Index / SD, Tasks\{GUID} Path / DynamicInfo / Actions); the plugin
+   only adds Author / Description / Source. It fails outright on Windows 7 / 2008 R2 hives (no plugin CSV). */
+function readTcCsvs(bf, pf){
+  var tc={all:[], byKey:{}, byGuid:{}, plugin:false, nTasks:0, nActs:0}, raw, idx, r, i;
   // path = normalized join key, disp = original case for display. Only "<path>" (live) and "<path>|del" keys
   // are ever joined to XML; a registration whose GUID conflicts with the one already holding that path gets a
   // "<path>|{GUID}" key, so it stays its own record instead of overwriting the live task's data.
   function entry(path, del, disp, guidKey){ var k=path+(guidKey?("|"+guidKey):(del?"|del":"")), e=tc.byKey[k];
-    if(!e){ e={path:path, disp:disp||path, del:!!del, guid:"", index:"", sd:false, hasId:false}; tc.byKey[k]=e; tc.all.push(e); } return e; }
+    if(!e){ e={path:path, disp:disp||path, del:!!del, guid:"", index:"", sd:false, hasId:false, key:k}; tc.byKey[k]=e; tc.all.push(e); } return e; }
   raw=parseCSV(readUtf8(bf.path)); idx=headIdx(raw[0]||[]);
   var iCat=idx.Category, iKp=idx.KeyPath, iVn=idx.ValueName, iVd=idx.ValueData, iDel=idx.Deleted, iLw=idx.LastWriteTimestamp;
-  var treePre="\\taskcache\\tree", acts={};
+  var treePre="\\taskcache\\tree", acts={}, tk={};
   for(i=1;i<raw.length;i++){ r=raw[i]; if(r.length<6) continue;
     var cat=cell(r,iCat), kp=cell(r,iKp), kpl=kp.toLowerCase(), vn=cell(r,iVn), vd=cell(r,iVd), del=(cell(r,iDel)==="True"), lw=normTs(cell(r,iLw));
     if(cat==="TaskCacheTree"){ var tp=kpl.indexOf(treePre); if(tp<0) continue;
       var tpo=kp.substring(tp+treePre.length), e=entry(normTaskPath(tpo), del, (tpo.charAt(0)==="\\"?"":"\\")+tpo);
       if(lw) e.treeLw=lw;
-      if(vn==="Id"){ e.guid=String(vd).toUpperCase(); e.hasId=true; } else if(vn==="Index") e.index=vd; else if(vn==="SD") e.sd=true; }
-    else if(cat==="TaskCacheActions"){ var gm=kp.match(/\{[0-9A-Fa-f\-]+\}\s*$/); if(gm) acts[gm[0].toUpperCase()]={hex:vd, del:del, lw:lw}; } }
-  // Tree keys without an Id value are folders, not tasks
-  var leaves=[]; for(i=0;i<tc.all.length;i++){ if(tc.all[i].hasId) leaves.push(tc.all[i]); else delete tc.byKey[tc.all[i].path+(tc.all[i].del?"|del":"")]; }
+      if(vn==="Id"){ e.guid=String(vd).toUpperCase(); e.hasId=true; } else if(vn==="Index") e.index=vd; else if(vn==="SD") e.sd=true;
+      continue; }
+    var gm=kp.match(/\{[0-9A-Fa-f\-]+\}\s*$/); if(!gm) continue;
+    var g=gm[0].toUpperCase();
+    if(cat==="TaskCacheActions"){ if(!acts[g] || !del) acts[g]={hex:vd, del:del, lw:lw}; }   // a live key wins over its slack copy
+    else if(cat==="TaskCachePath"){ tk[g]=tk[g]||{}; if(!del || tk[g].path==null) tk[g].path=vd; if(del) tk[g].delSeen=true; else tk[g].liveSeen=true; }
+    else if(cat==="TaskCacheDyn"){ tk[g]=tk[g]||{}; if(!del || !tk[g].dyn) tk[g].dyn=decodeDyn(vd); if(del) tk[g].delSeen=true; else tk[g].liveSeen=true; } }
+  // Tree keys without an Id value are folders, not tasks - except a DELETED key with no child keys: hive slack
+  // often keeps a removed task's key but not its values (seen on a 2008 R2 RegBack copy), so it stays as a deleted task
+  var hasChild={}, leaves=[];
+  for(i=0;i<tc.all.length;i++){ var pp=tc.all[i].path.split("\\"), acc=""; for(var q=1;q<pp.length-1;q++){ acc+="\\"+pp[q]; hasChild[acc]=1; } }
+  for(i=0;i<tc.all.length;i++){ var te=tc.all[i];
+    if(te.hasId || (te.del && te.path!=="\\" && !hasChild[te.path] && !tc.byKey[te.path])) leaves.push(te); else delete tc.byKey[te.key]; }
   tc.all=leaves;
   for(i=0;i<tc.all.length;i++){ var le=tc.all[i]; if(le.guid && (!tc.byGuid[le.guid] || tc.byGuid[le.guid].del)) tc.byGuid[le.guid]=le; }
+  // Tasks\{GUID} keys: GUID first. Fall back to the path only when that entry has no GUID yet or the SAME GUID - a
+  // different GUID at the same path (e.g. a deleted registration recovered from hive slack) is a separate task.
+  function claim(g, path, del){
+    var po=trimStr(path||""); if(!po) po="(TaskCache "+g+")";      // keys recovered from hive slack can lose their Path value
+    var p=normTaskPath(po), pe=tc.byGuid[g], pk=tc.byKey[p];
+    if(!pe && pk && (!pk.guid || pk.guid===g)) pe=pk;
+    if(!pe){ pe=pk?entry(p,!!del,po,g):entry(p,!!del,po); pe.hasId=false; }
+    if(path && pe.disp===pe.path) pe.disp=po;                      // prefer the original-case path
+    if(!pe.guid) pe.guid=g; tc.byGuid[g]=pe; if(del) pe.tasksDel=true; else pe.inTasks=true;   // only a LIVE Tasks key means registered; a slack copy just adds its data
+    return pe; }
+  for(var tg in tk){ if(!tk.hasOwnProperty(tg)) continue; tc.nTasks++;
+    var t=tk[tg], te2=claim(tg, t.path, !!t.delSeen && !t.liveSeen);
+    if(t.dyn){ te2.created=t.dyn.created; te2.lastStart=t.dyn.lastStart; te2.lastStop=t.dyn.lastStop; te2.state=t.dyn.state; te2.result=t.dyn.result; } }
   if(pf){ raw=parseCSV(readUtf8(pf.path)); idx=headIdx(raw[0]||[]);
+    if(!("KeyName" in idx) || !("Path" in idx)) pf=null; }               // never read anything else as the plugin CSV
+  if(pf){ tc.plugin=true;
     for(i=1;i<raw.length;i++){ r=raw[i]; if(r.length<6) continue;
-      var g=String(cell(r,idx.KeyName)).toUpperCase(), po=trimStr(cell(r,idx.Path));
-      if(!po) po="(TaskCache "+g+")";                              // keys recovered from hive slack can lose their Path value
-      var p=normTaskPath(po);
-      // GUID first. Fall back to the path only when that entry has no GUID yet or the SAME GUID - a different GUID
-      // at the same path (e.g. a deleted registration recovered from hive slack) is a separate task.
-      var pe=tc.byGuid[g], pk=tc.byKey[p];
-      if(!pe && pk && (!pk.guid || pk.guid===g)) pe=pk;
-      if(!pe){ pe=pk?entry(p,false,po,g):entry(p,false,po); pe.hasId=false; }
-      if(po && pe.disp===pe.path) pe.disp=po;                      // prefer the plugin's original-case path
-      if(!pe.guid) pe.guid=g; tc.byGuid[g]=pe; pe.inTasks=true;
-      pe.created=normTs(cell(r,idx.CreatedOn)); pe.lastStart=normTs(cell(r,idx.LastStart)); pe.lastStop=normTs(cell(r,idx.LastStop));
-      pe.state=cell(r,idx.TaskState); pe.result=cell(r,idx.LastActionResult);
-      pe.author=cell(r,idx.Author); pe.desc=cell(r,idx.Description); pe.source=cell(r,idx.Source); } }
-  for(var ag in acts){ if(!acts.hasOwnProperty(ag)) continue;
+      var pg=String(cell(r,idx.KeyName)).toUpperCase(); if(!/^\{[0-9A-F\-]+\}$/.test(pg)) continue;
+      var pe2=claim(pg, cell(r,idx.Path), false);
+      if(!pe2.created){ pe2.created=normTs(cell(r,idx.CreatedOn)); pe2.lastStart=normTs(cell(r,idx.LastStart)); pe2.lastStop=normTs(cell(r,idx.LastStop));
+        pe2.state=cell(r,idx.TaskState); pe2.result=cell(r,idx.LastActionResult); }
+      pe2.author=cell(r,idx.Author); pe2.desc=cell(r,idx.Description); pe2.source=cell(r,idx.Source); } }
+  for(var ag in acts){ if(!acts.hasOwnProperty(ag)) continue; tc.nActs++;
     var ae=tc.byGuid[ag]; if(!ae){ ae=entry("(taskcache "+ag.toLowerCase()+")", acts[ag].del, "(TaskCache "+ag+")", ag); ae.guid=ag; tc.byGuid[ag]=ae; }
-    ae.inTasks=true; if(acts[ag].del) ae.tasksDel=true;
+    if(acts[ag].del) ae.tasksDel=true; else ae.inTasks=true;
     var dec=decodeActions(acts[ag].hex);
     if(dec){ var al=[], cl=[], k2; for(k2=0;k2<dec.acts.length;k2++){ al.push(fmtAction(dec.acts[k2])); if(dec.acts[k2].t==="Exec") cl.push(dec.acts[k2].cmd); }
       ae.acts=dec.acts; ae.regActions=al.join(" || ")+(dec.ok?"":" (partially decoded)"); ae.regCmds=cl.join(" | "); } }
-  // SD sanity: Tarrask-style hiding removes the SD from one or two tasks. When most of a host's live Tree
-  // leaves have no SD, the data cannot support the check (partial / sparse hive copy, parser difference):
-  // record SD as "unknown" instead of flagging every task as hidden.
-  var live=0, noSd=0;
-  for(i=0;i<tc.all.length;i++){ if(tc.all[i].hasId && !tc.all[i].del){ live++; if(!tc.all[i].sd) noSd++; } }
-  tc.sdBulk=(live>=6 && noSd>live*0.25);
-  if(tc.sdBulk) RUN.warn.push("Root "+root.n+": "+noSd+" of "+live+" TaskCache Tree entries carry no SD value - too many to be hidden tasks, so the hidden-task (NOSD) check is not applied on this host. Check the hive copy (sparse / partial upload?).");
-  appendLog("Root "+root.n+": TaskCache - "+tc.all.length+" Tree task entries ("+live+" live, "+(live-noSd)+" with SD"+(tc.sdBulk?" - SD check disabled":"")+"), "+(pf?"plugin times present":"NO plugin output (times blank)")+(tc.nl?", processed without log replay":""));
+  tc.legacy=(tc.nTasks>0 && tc.nActs===0);                                 // Windows 7 / 2008 R2 layout: no Actions, no SD
   return tc;
 }
+function loadTaskCache(root){
+  if(!root.hive || !root.tcDir || !folderExists(root.tcDir)) return null;
+  var bf=newestFile(root.tcDir, /_RECmd_Batch_.*\.csv$/i, false), pf=newestFile(root.tcDir, /^(?!.*_RECmd_Batch_).*_TaskCache_.*\.csv$/i, true);
+  if(!bf){ RUN.warn.push("Root "+root.n+": RECmd produced no CSV - cross-check skipped (see log)."); return null; }
+  keepRawTc(root, bf, pf, "");
+  var tc=readTcCsvs(bf, pf), i;
+  tc.nl=!!root.tcNl;
+  // SD sanity: Tarrask-style hiding removes the SD from one or two tasks. When most of a host's live Tree
+  // leaves have no SD, the data cannot support the check (Windows 7 / 2008 R2 layout, partial / sparse hive copy,
+  // parser difference): record SD as "unknown" instead of flagging every task as hidden.
+  var live=0, noSd=0;
+  for(i=0;i<tc.all.length;i++){ if(tc.all[i].hasId && !tc.all[i].del){ live++; if(!tc.all[i].sd) noSd++; } }
+  tc.sdBulk=(live>=6 && noSd>live*0.25) || (tc.legacy && live>0 && noSd===live);
+  if(tc.sdBulk && tc.legacy && noSd===live) appendLog("Root "+root.n+": Windows 7 / Server 2008 R2 TaskCache layout (no SD and no Actions values) - the hidden-task (NOSD) and action-mismatch checks do not apply to this host.");
+  else if(tc.sdBulk) RUN.warn.push("Root "+root.n+": "+noSd+" of "+live+" TaskCache Tree entries carry no SD value - too many to be hidden tasks, so the hidden-task (NOSD) check is not applied on this host. Check the hive copy (sparse / partial upload?).");
+  if(!tc.plugin && tc.nTasks) appendLog("Root "+root.n+": RECmd's TaskCache plugin wrote no usable output"+(String(RUN.stageLog||"").indexOf("Plugin TaskCache error")>=0?" (it errored on this hive - expected on the Windows 7 / Server 2008 R2 layout)":"")+" - created / last-run times decoded from DynamicInfo instead; Author / Description unavailable.");
+  appendLog("Root "+root.n+": TaskCache - "+tc.all.length+" task entries ("+live+" live Tree leaves, "+(live-noSd)+" with SD; "+tc.nTasks+" Tasks keys, "+tc.nActs+" with Actions)"+(tc.plugin?", plugin output read":"")+(tc.nl?", processed without log replay":""));
+  // RegBack copy (B): mark what it knew about the current entries, add what the current hive no longer has
+  if(root.rbHive && root.rbTcDir && folderExists(root.rbTcDir)){
+    var rbf=newestFile(root.rbTcDir, /_RECmd_Batch_.*\.csv$/i, false);
+    if(rbf){ keepRawTc(root, rbf, null, "RegBack"); mergeRegBack(root, tc, readTcCsvs(rbf, null)); }
+    else RUN.warn.push("Root "+root.n+": RECmd produced no CSV for the RegBack hive "+root.rbHive+" - RegBack sweep skipped (see log)."); }
+  return tc;
+}
+function regBackTime(root){
+  var k="\\windows\\system32\\config\\regback\\"+baseName(root.rbHive).toLowerCase(), mt=root.meta?root.meta[k]:null;
+  if(mt && mt.m) return mt.m;
+  try{ var f=new ActiveXObject("Scripting.FileSystemObject").GetFile(root.rbStage+"\\"+baseName(root.rbHive)); var s=dateUtcStr(f.DateLastModified); return s?(s+" (file time)"):""; }catch(e){ return ""; }
+}
+function mergeRegBack(root, tc, rb){
+  var i, nMark=0, nAdd=0, nDel=0;
+  tc.rbUtc=regBackTime(root);
+  for(i=0;i<rb.all.length;i++){ var b=rb.all[i], st=b.del?"deleted":(b.inTasks?"registered":"tree-only");
+    var cur=tc.byKey[b.path] || tc.byKey[b.path+"|del"];
+    if(cur){ if(!cur.rbStatus || st==="registered") cur.rbStatus=st;
+      // the current hive lost data the backup still has (a tree-only residue, a slack key): borrow it, labelled
+      if(!cur.regActions && b.regActions){ cur.acts=b.acts; cur.regActions=b.regActions+" [RegBack]"; cur.regCmds=b.regCmds; }
+      if(!cur.created && b.created){ cur.created=b.created; cur.lastStart=b.lastStart; cur.lastStop=b.lastStop; cur.state=b.state; cur.result=b.result; }
+      if(!cur.author && b.author) cur.author=b.author;
+      nMark++; continue; }
+    if(/^\\microsoft\\/.test(b.path) && !b.inTasks && !b.del && b.index==="0") continue;   // stale Microsoft leftover there too
+    var k=b.path+(st==="deleted"?"|rbdel":"|rb"); if(tc.byKey[k]) continue;
+    b.rbOnly=true; b.rbStatus=st; b.key=k; tc.byKey[k]=b; tc.all.push(b); nAdd++; if(st==="deleted") nDel++; }
+  appendLog("Root "+root.n+": RegBack copy ("+(tc.rbUtc||"time unknown")+") - "+rb.all.length+" task entries; "+nMark+" also in the current hive, "+(nAdd-nDel)+" registered there but gone now, "+nDel+" deleted keys recovered from its slack.");
+}
+/* ---------- event logs (A): wevtutil XML -> one record per event -> one summary per task ----------
+   TaskScheduler/Operational records the lifecycle (106 registered, 140 updated, 141 deleted) and every run
+   (100 started, 129 process created with the image path, 200 / 201 action started / completed); Security
+   4698-4702 adds the account and the full task XML when object-access auditing is on. A task registered, run
+   and deleted between collections leaves no XML and often no TaskCache key - only these events. */
+function evtTs(s){ var m=String(s).match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.(\d{1,7}))?/); if(!m) return "";
+  return m[1]+" "+m[2]+"."+((m[4]||"")+"000").substring(0,3); }
+function evtMs(s){ var m=String(s).match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(\.(\d{1,7}))?/); if(!m) return 0;
+  return Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6])+parseInt(((m[8]||"")+"000").substring(0,3),10); }
+function evtText(n){ try{ return String(n.text); }catch(e){ return ""; } }
+function evtFromNode(ev, log, src, wd){
+  var sys=null, ed=null, c;
+  for(c=ev.firstChild; c; c=c.nextSibling){ if(c.nodeType!==1) continue; var nm=nodeName(c); if(nm==="System") sys=c; else if(nm==="EventData") ed=c; }
+  if(!sys) return null;
+  var o={id:0, t:"", rec:"", log:log, src:src, wd:wd}, d={};
+  for(c=sys.firstChild; c; c=c.nextSibling){ if(c.nodeType!==1) continue; var sn=nodeName(c);
+    if(sn==="EventID") o.id=parseInt(evtText(c),10)||0;
+    else if(sn==="TimeCreated") o.t=String(c.getAttribute("SystemTime")||"");
+    else if(sn==="EventRecordID") o.rec=evtText(c); }
+  if(ed){ for(c=ed.firstChild; c; c=c.nextSibling){ if(c.nodeType!==1) continue; var dn=c.getAttribute("Name"); if(dn) d[dn]=evtText(c); } }
+  o.task=trimStr(d.TaskName||"");
+  // event 129 can name the task by its task-host account form ("NT TASK\MicrosoftEdgeUpdateTaskMachineCore"): same task
+  if(/^\\?NT TASK\\/i.test(o.task)) o.task="\\"+o.task.replace(/^\\?NT TASK\\/i,"");
+  o.user=d.UserContext||d.UserName||(d.SubjectUserName?((d.SubjectDomainName?(d.SubjectDomainName+"\\"):"")+d.SubjectUserName):"");
+  o.action=d.Path||d.ActionName||""; o.inst=d.InstanceId||d.TaskInstanceId||""; o.pid=d.ProcessID||""; o.res=d.ResultCode||"";
+  o.content=d.TaskContent||d.TaskContentNew||"";
+  o.ts=evtTs(o.t); o.ms=evtMs(o.t);
+  return o;
+}
+function evtSpan(x){
+  function one(p){ try{ if(!p || !fileExists(p)) return ""; var m=String(readUtf8(p)).match(/SystemTime=["']([^"']+)["']/); return m?evtTs(m[1]).substring(0,19):""; }catch(e){ return ""; } }
+  return {old:one(x.old), nw:one(x.nw)}; }
+/* async, in slices: a 10 MB TaskScheduler log is ~16k events; the UI stays live and shows progress */
+function parseEvents(){
+  var R=RUN;
+  try{
+    if(!R.evCur){
+      if(!R.evQ.length){ window.setTimeout(joinAndWrite, 10); return; }
+      var root=R.evQ[0];
+      root.evt=root.evt||{list:[], span:{}};
+      while(root.evtXml.length && !R.evCur){ var x=root.evtXml.shift();
+        if(x.old) root.evt.span[x.log]=evtSpan(x);
+        var txt=""; try{ if(fileExists(x.f)) txt=String(readUtf8(x.f)); }catch(e1){ R.warn.push("Could not read the "+x.log+" event export for root "+root.n+": "+e1.message); }
+        if(!/<Event[\s>]/.test(txt)){ appendLog("Root "+root.n+": "+x.log+" - no task events"+(txt?"":" (no export - see the log for the wevtutil error)")); continue; }
+        var d=newDom(), ok=false; if(d){ try{ ok=d.loadXML(txt); }catch(e2){ ok=false; } }
+        if(!ok || !d.documentElement){ R.warn.push("The "+x.log+" event export for root "+root.n+" could not be parsed"+(d&&d.parseError?(" ("+trimStr(d.parseError.reason)+")"):"")+" - skipped."); continue; }
+        R.evCur={root:root, x:x, nodes:d.documentElement.childNodes, i:0, n:0, dom:d}; }
+      if(!R.evCur){ R.evQ.shift(); window.setTimeout(parseEvents, 1); return; }
+    }
+    var cur=R.evCur, nodes=cur.nodes, len=nodes.length, end=Math.min(cur.i+1500, len), wd=winKey(cur.root);
+    for(; cur.i<end; cur.i++){ var nd=nodes[cur.i]; if(nd.nodeType!==1) continue;
+      var ev=evtFromNode(nd, cur.x.log, cur.x.src, wd); if(ev && ev.task){ cur.root.evt.list.push(ev); cur.n++; } }
+    setStatus("Reading the "+cur.x.log+" event log... "+nf(cur.i)+" / "+nf(len)+" events","muted");
+    if(cur.i>=len){ var sp=cur.root.evt.span[cur.x.log];
+      appendLog("Root "+cur.root.n+": "+cur.x.log+" - "+nf(cur.n)+" task event(s)"+(sp&&sp.old?(", log covers "+sp.old+" -> "+sp.nw+" UTC"):""));
+      R.evCur=null; if(!cur.root.evtXml.length) R.evQ.shift(); }
+    window.setTimeout(parseEvents, 1);
+  }catch(ex){ R.warn.push("Event-log parsing failed: "+ex.message); R.evQ=[]; R.evCur=null; window.setTimeout(joinAndWrite, 10); }
+}
+/* events of one collection -> per-task summaries (key = normalized task path) */
+/* account equality across event sources: "ACME\\jdoe" = "jdoe", "NT AUTHORITY\\System" = "SYSTEM"; unknown is never equal */
+function acctKey(a){ a=trimStr(String(a||"")).toLowerCase(); if(!a) return ""; a=a.substring(a.lastIndexOf("\\")+1); return (a==="localsystem")?"system":a; }
+function sameAcct(a,b){ var x=acctKey(a), y=acctKey(b); return !!x && x===y; }
+function evtSummaries(list){
+  var by={}, out=[], i, j;
+  list.sort(function(a,b){ return a.t<b.t?-1:(a.t>b.t?1:((+a.rec||0)-(+b.rec||0))); });
+  for(i=0;i<list.length;i++){ var e=list[i], k=normTaskPath(e.task), s=by[k], id=e.id;
+    if(!s){ s=by[k]={key:k, disp:(e.task.charAt(0)==="\\"?"":"\\")+e.task, evts:[], src:{}, life:"", regAt:0, ranSince:false, runUser:"", gap:-1, selfGap:-1, inst100:{}, inst200:{}, n100:0, n200:0, n129:0, runs:[]}; out.push(s); }
+    s.evts.push(e); s.src[e.src]=1;
+    if(id===106 || id===4698){ if(!s.reg) s.reg=e; s.life="reg"; s.regAt=e.ms; s.ranSince=false; s.runUser=""; if(e.content){ s.content=e.content; s.contentId=id; } }
+    else if(id===140 || id===4702){ s.upd=e; if(s.life!=="del") s.life="reg"; s.regAt=e.ms; s.ranSince=false; s.runUser=""; if(e.content){ s.content=e.content; s.contentId=id; } }
+    else if(id===141 || id===4699){ s.del=e; s.life="del";
+      // gap = this deletion minus the (re-)registration / update before it, counted only when the task RAN in between -
+      // the register-run-delete shape (min over deletions)
+      // ... split by WHO deleted it: the account it ran as (self-cleaning software) or another one (the operator)
+      if(s.regAt && s.ranSince && e.ms>=s.regAt){ var g=e.ms-s.regAt;
+        if(sameAcct(s.runUser, e.user)){ if(s.selfGap<0 || g<s.selfGap) s.selfGap=g; } else if(s.gap<0 || g<s.gap) s.gap=g; }
+      s.regAt=0; s.ranSince=false; s.runUser=""; }
+    else if(id===100){ if(e.inst && !s.inst100[e.inst]){ s.inst100[e.inst]=1; s.n100++; } s.runs.push(e.ts); s.ranSince=true; if(e.user) s.runUser=e.user; }
+    else if(id===200){ if(e.inst && !s.inst200[e.inst]){ s.inst200[e.inst]=1; s.n200++; } s.ranSince=true; }
+    else if(id===129){ s.n129++; s.ranSince=true; } }
+  for(i=0;i<out.length;i++){ var su=out[i];
+    su.status=(su.life==="del")?"deleted":((su.life==="reg")?"registered":"logged");
+    su.nRuns=su.n100||su.n200||su.n129;
+    var rt=[]; for(j=0;j<su.evts.length;j++){ var ej=su.evts[j]; if(ej.id===100 || (!su.n100 && (ej.id===200 || ej.id===129))) rt.push(ej.ts); }
+    su.firstRun=rt.length?rt[0]:""; su.lastRun=rt.length?rt[rt.length-1]:"";
+    // what actually ran, newest first: 129 has the image path; 200's ActionName can be a bare name ("cmd")
+    var imgs=[], seen={}, full={}, keep=[];
+    for(j=su.evts.length-1;j>=0;j--){ var ea=su.evts[j]; if(!((ea.id===129 || ea.id===200 || ea.id===201) && ea.action)) continue;
+      var a=trimStr(ea.action), al=a.toLowerCase(); if(seen[al]) continue; seen[al]=1; imgs.push(a); }
+    for(j=0;j<imgs.length;j++){ if(/[\\\/]/.test(imgs[j])) full[launcherName(imgs[j])]=1; }
+    for(j=0;j<imgs.length;j++){ if(!/[\\\/]/.test(imgs[j]) && full[launcherName(imgs[j])]) continue; keep.push(imgs[j]); }
+    su.imgs=keep; }
+  return out;
+}
+var DEFCOLS=["Author","Description","Uri","RegDate","Source","SecurityDescriptor","XmlVersion","RunAs","LogonType","RunLevel","Enabled","Hidden",
+  "DeleteExpired","TriggerCount","TriggerTypes","TriggerSummary","StartBoundary","EndBoundary","MinRepetition","ActionCount","ActionType",
+  "Command","Arguments","WorkingDir","ComClassId","ComData","AllActions","ActionCommands"];
+function fillEvt(row, s){
+  row.EvtStatus=s.status; row.EvtEvents=String(s.evts.length); row.EvtRuns=String(s.nRuns);
+  row.EvtRegisteredUtc=s.reg?s.reg.ts.substring(0,19):""; row.EvtRegisteredBy=s.reg?s.reg.user:"";
+  row.EvtUpdatedUtc=s.upd?s.upd.ts.substring(0,19):"";
+  row.EvtDeletedUtc=s.del?s.del.ts.substring(0,19):""; row.EvtDeletedBy=s.del?s.del.user:"";
+  row.EvtDeleteGapSecs=(s.gap>=0)?String(Math.round(s.gap/100)/10):""; row.EvtSelfDeleteGapSecs=(s.selfGap>=0)?String(Math.round(s.selfGap/100)/10):"";
+  row.EvtFirstRunUtc=s.firstRun.substring(0,19); row.EvtLastRunUtc=s.lastRun.substring(0,19);
+  row.EvtActions=s.imgs.join(" | ");
+  if(row.AllActions || row.Command || row.ComClassId) return;
+  // no surviving definition: Security 4698 / 4702 carries the whole task XML when object-access auditing is on
+  if(s.content){ var tmp={}, k;
+    if(parseTaskXmlInto(tmp, s.content)==="ok"){ for(k=0;k<DEFCOLS.length;k++){ if(!row[DEFCOLS[k]] && tmp[DEFCOLS[k]]!=null) row[DEFCOLS[k]]=tmp[DEFCOLS[k]]; }
+      row.EvtDefinition=String(s.contentId); return; } }
+  // otherwise show what the log saw it run
+  if(s.imgs.length){ var al=[]; for(var i=0;i<s.imgs.length;i++) al.push("Exec: "+s.imgs[i]+" [event log]");
+    row.ActionType="Exec"; row.Command=s.imgs[0]; row.ActionCount=String(s.imgs.length); row.ActionCommands=s.imgs.join(" | "); row.AllActions=al.join(" || "); }
+}
+function evtOnlyRow(root, s){
+  var r={}, i, k, sl=[]; for(i=0;i<CSVCOLS.length;i++) r[CSVCOLS[i]]="";
+  r._root=root; r._relDec="";
+  r.TaskPath=s.disp; r.TasksRoot=root.path; r.ParseStatus="no-xml";
+  for(k in s.src){ if(s.src.hasOwnProperty(k)) sl.push(k); }
+  r.SourceFile=sl.join(" + ")+" [event log]";
+  return r;
+}
+/* which row of a task path gets its events: the XML, else the live registration, else residue / backup / slack */
+function rowRank(row){
+  if(row.ParseStatus!=="no-xml") return 0;
+  var o={"reg-only":1,"tree-only":2,"regback-only":3,"deleted":4}; return o[row.RegStatus]||5; }
 function resultHex(v){ var n=parseInt(v,10); if(isNaN(n)) return String(v||""); if(n<0) n+=4294967296; return "0x"+hx(n,8); }
 function fillReg(row, e, tc){
   row.RegGuid=e.guid||""; row.RegCreatedUtc=e.created||""; row.RegLastStartUtc=e.lastStart||""; row.RegLastStopUtc=e.lastStop||"";
   row.RegLastResult=(e.result!=null && e.result!=="")?resultHex(e.result):""; row.RegTaskState=e.state||"";
-  row.TreeLastWriteUtc=e.treeLw||""; row.TreeIndex=e.index||""; row.TreeSD=e.hasId?(e.sd?"yes":((tc && tc.sdBulk)?"unknown":"no")):"";
+  row.TreeLastWriteUtc=e.treeLw||""; row.TreeIndex=e.index||"";
+  // the hidden-task SD check is about the CURRENT hive only - a RegBack-only entry never gets "no"
+  row.TreeSD=(e.hasId && !e.rbOnly)?(e.sd?"yes":((tc && tc.sdBulk)?"unknown":"no")):"";
   row.RegActions=e.regActions||""; row.RegActionCommands=e.regCmds||"";
+  row.RegBackStatus=e.rbStatus||""; row.RegBackUtc=e.rbStatus?((tc && tc.rbUtc)||""):"";
 }
 function regOnlyRow(root, e){
   var r={}, i; for(i=0;i<CSVCOLS.length;i++) r[CSVCOLS[i]]="";
   r._root=root; r._relDec="";
   r.TaskPath=(e.disp.charAt(0)==="\\" || e.disp.charAt(0)==="(")?e.disp:("\\"+e.disp);
-  r.TasksRoot=root.path; r.SourceFile=root.hive+" [TaskCache"+(e.guid?(" "+e.guid):"")+"]";
+  r.TasksRoot=root.path; r.SourceFile=(e.rbOnly?root.rbHive:root.hive)+" [TaskCache"+(e.guid?(" "+e.guid):"")+"]";
   r.ParseStatus="no-xml";
-  r.RegStatus=(e.del||e.tasksDel)?"deleted":(e.inTasks?"reg-only":"tree-only");
+  // only a LIVE Tasks key means registered; a live Tree leaf without one is tree-only even if a slack copy of
+  // its Tasks key was recovered. RegBack-only: registered in the backup copy, gone from the current hive.
+  r.RegStatus=e.del?"deleted":(e.rbOnly?"regback-only":(e.inTasks?"reg-only":"tree-only"));
   fillReg(r,e,root.tc);
   r.Author=e.author||""; r.Description=e.desc||""; r.Source=e.source||"";
   if(e.acts && e.acts.length){ var a0=e.acts[0];
@@ -1280,37 +1620,60 @@ function joinAndWrite(){
       // join on the TaskPath only: for real Tasks roots that is the file's LOCATION (what the scheduler loads); <URI>
       // is attacker-writable and must not let one file claim another task's registration. (Flat / single-file
       // inputs already use <URI> as their TaskPath, so nothing is lost there.)
-      if(r.tc){ var e=r.tc.byKey[normTaskPath(row.TaskPath)] || r.tc.byKey[normTaskPath(row.TaskPath)+"|del"];
-        if(e){ e.used=true; fillReg(row,e,r.tc); row.RegStatus=e.del?"xml-only":"matched"; }   // only a DELETED registration left: the XML is unregistered
+      if(r.tc){ var jp=normTaskPath(row.TaskPath), e=r.tc.byKey[jp] || r.tc.byKey[jp+"|del"] || r.tc.byKey[jp+"|rb"] || r.tc.byKey[jp+"|rbdel"];
+        // only a DELETED (or RegBack-only) registration left: the XML is unregistered in the current hive
+        if(e){ e.used=true; fillReg(row,e,r.tc); row.RegStatus=(e.del||e.rbOnly)?"xml-only":"matched"; }
         else if(/^(ok|not-utf16|malformed)$/.test(row.ParseStatus)) row.RegStatus="xml-only"; } }
     // every TaskCache entry no XML claimed becomes its own row (registered-only, tree-only, or deleted & recovered)
     for(i=0;i<R.roots.length;i++){ r=R.roots[i]; if(!r.tc || r.shareWith) continue;   // a shared hive emits its leftovers once, from its owner root
       for(j=0;j<r.tc.all.length;j++){ if(!r.tc.all[j].used) extra.push(regOnlyRow(r, r.tc.all[j])); } }
     for(i=0;i<extra.length;i++) R.rows.push(extra[i]);
-    if(!R.rows.length){ runFail("Nothing to report: no task files were staged and the TaskCache sweep returned no task entries"+(R.warn.length?(" - "+R.warn.join(" ")):".")); return; }
-    for(i=0;i<R.rows.length;i++){ row=R.rows[i];
+    // event-log correlation (A): each task's events go to its best row; a task known ONLY from the log gets its own row
+    var nEvtRoots=0, nEvtTasks=0, nEvtOnly=0, evOut=[];
+    for(i=0;i<R.roots.length;i++){ r=R.roots[i]; if(!r.evt) continue; nEvtRoots++;
+      var sums=evtSummaries(r.evt.list), wk=winKey(r), best={}, eo=0;
+      for(j=0;j<R.rows.length;j++){ row=R.rows[j]; if(winKey(row._root)!==wk) continue;
+        var bk=normTaskPath(row.TaskPath), rk=rowRank(row); if(!best[bk] || rk<best[bk].rk) best[bk]={row:row, rk:rk}; }
+      for(j=0;j<sums.length;j++){ var su=sums[j], bt=best[su.key];
+        if(bt) fillEvt(bt.row, su); else { var nr=evtOnlyRow(r, su); fillEvt(nr, su); R.rows.push(nr); eo++; } }
+      for(j=0;j<r.evt.list.length;j++) evOut.push(r.evt.list[j]);
+      nEvtTasks+=sums.length; nEvtOnly+=eo;
+      appendLog("Root "+r.n+": event log - "+nf(r.evt.list.length)+" task event(s) for "+sums.length+" task path(s); "+eo+" known only from the log."); }
+    if(!R.rows.length){ runFail("Nothing to report: no task files were staged and neither the TaskCache sweep nor the event logs returned a task"+(R.warn.length?(" - "+R.warn.join(" ")):".")); return; }
+    for(i=0;i<R.rows.length;i++){ row=R.rows[i]; var nx=(row.ParseStatus==="no-xml");
+      var evLast=row.EvtDeletedUtc||[row.EvtUpdatedUtc,row.EvtRegisteredUtc,row.EvtLastRunUtc].sort().pop()||"";
       if(row.FileTimeSource==="vr-metadata"){ row.ChangedUtc=row.FileModifiedUtc; row.ChangedSource="vr-metadata"; }
+      else if(nx && row.EvtDeletedUtc && (!row.TreeLastWriteUtc || row.EvtDeletedUtc>row.TreeLastWriteUtc)){ row.ChangedUtc=row.EvtDeletedUtc; row.ChangedSource="event-log"; }   // gone: when it went
       else if(row.TreeLastWriteUtc){ row.ChangedUtc=row.TreeLastWriteUtc; row.ChangedSource="taskcache-tree"; }
-      else if(row.RegCreatedUtc && row.ParseStatus==="no-xml"){ row.ChangedUtc=row.RegCreatedUtc; row.ChangedSource="taskcache-created"; }
+      else if(row.RegCreatedUtc && nx){ row.ChangedUtc=row.RegCreatedUtc; row.ChangedSource="taskcache-created"; }
+      else if(nx && evLast){ row.ChangedUtc=evLast; row.ChangedSource="event-log"; }
       else if(row.FileModifiedUtc){ row.ChangedUtc=row.FileModifiedUtc; row.ChangedSource=row.FileTimeSource; } }
     // write the one CSV
     var lines=[CSVCOLS.join(",")];
     for(i=0;i<R.rows.length;i++){ var cells=[]; for(j=0;j<CSVCOLS.length;j++) cells.push(cq(R.rows[i][CSVCOLS[j]])); lines.push(cells.join(",")); }
-    var name=R.stamp+"_SchedTasks_Output.csv", path=R.outdir+"\\"+name;
+    var name=R.stamp+"_SchedTasks_Output.csv", path=R.outdir+"\\"+name, produced=[{name:name}];
     try{ var fso=new ActiveXObject("Scripting.FileSystemObject"); if(!fso.FolderExists(R.outdir)) runBat(['mkdir "'+batEsc(R.outdir)+'" > "__LOG__" 2>&1']); }catch(em){}
     writeUtf8(path, lines.join("\r\n")+"\r\n");
+    // companion CSV: every task event, one row each (the detail pane's per-task history; loads on its own as a plain table)
+    if(nEvtRoots){ var evName=R.stamp+"_SchedTasks_Events.csv", el=[EVTCOLS.join(",")];
+      evOut.sort(function(a,b){ return a.t<b.t?-1:(a.t>b.t?1:((+a.rec||0)-(+b.rec||0))); });
+      for(i=0;i<evOut.length;i++){ var ev=evOut[i];
+        el.push([cq(ev.ts),cq(ev.id),cq(EVT_MEANING[ev.id]||""),cq(ev.log),cq(ev.task),cq(ev.user),cq(ev.action),cq(ev.inst),cq(ev.pid),
+          cq(ev.res),cq(ev.rec),cq(ev.wd),cq(ev.src),cq(ev.content)].join(",")); }
+      writeUtf8(R.outdir+"\\"+evName, el.join("\r\n")+"\r\n"); produced.push({name:evName}); }
     cleanupStage(R.stage);
-    var nTc=0, nMeta=0; for(i=0;i<R.roots.length;i++){ if(R.roots[i].tc) nTc++; if(R.roots[i].meta) nMeta++; }
-    appendLog("Wrote "+path+" - "+R.rows.length+" row(s) from "+R.roots.length+" root(s); TaskCache cross-check on "+nTc+", collection time metadata on "+nMeta+".");
+    var nTc=0, nMeta=0, nRb=0; for(i=0;i<R.roots.length;i++){ if(R.roots[i].tc) nTc++; if(R.roots[i].meta) nMeta++; if(R.roots[i].tc && R.roots[i].rbHive && !R.roots[i].shareWith) nRb++; }
+    appendLog("Wrote "+path+" - "+R.rows.length+" row(s) from "+R.roots.length+" root(s); TaskCache cross-check on "+nTc+(nRb?(" (+ RegBack copy on "+nRb+")"):"")+", event logs on "+nEvtRoots+" ("+nEvtTasks+" task path(s), "+nEvtOnly+" only in the log), collection time metadata on "+nMeta+".");
     for(i=0;i<R.warn.length;i++) appendLog("WARNING: "+R.warn[i]);
     LASTOUTDIR=R.outdir;
-    writeRunInfo(R.outdir, R.inp, [{name:name}]);
+    writeRunInfo(R.outdir, R.inp, produced);
     var all=listCsvFiles(R.outdir); PRODUCED=all; populateProduced(all);
     try{ $("producedSel").value=path; }catch(e4){}
     BUSY=false; $("procBtn").disabled=false; procStop(true);
     loadCsvFile(path);
     patchRunInfoSummary(buildRunSummary());   // rows are scored now - add the triage headline to the runinfo entry
-    var msg="Processed "+nf(R.rows.length)+" task(s) from "+R.roots.length+" root(s)"+(nTc?(" with TaskCache cross-check on "+nTc):" (no TaskCache cross-check)")+" -> "+name;
+    var msg="Processed "+nf(R.rows.length)+" task(s) from "+R.roots.length+" root(s)"+(nTc?(" with TaskCache cross-check on "+nTc):" (no TaskCache cross-check)")
+      +(nEvtRoots?(", event logs on "+nEvtRoots+" ("+nEvtOnly+" task(s) only in the log)"):"")+" -> "+name;
     if(R.warn.length) setStatus(msg+" - "+R.warn.length+" warning(s), see log","err"); else setStatus(msg,"ok");
   }catch(ex){ runFail("Processing failed while joining / writing: "+ex.message); }
 }
@@ -1329,7 +1692,8 @@ function populateProduced(list){
   var sel=$("producedSel"); sel.innerHTML="";
   for(var i=0;i<list.length;i++){
     var lab=list[i].name+"  ("+fmtSize(list[i].size)+")";
-    if(/_SchedTasks_Output\.csv$/i.test(list[i].name)) lab+="  -  one row per task (XML + TaskCache)";
+    if(/_SchedTasks_Output\.csv$/i.test(list[i].name)) lab+="  -  one row per task (XML + TaskCache + event log)";
+    else if(/_SchedTasks_Events\.csv$/i.test(list[i].name)) lab+="  -  one row per Task Scheduler event";
     var o=document.createElement("option"); o.value=list[i].path; o.text=lab; sel.add(o);
   }
   showEl("producedRow", list.length>0);
@@ -1375,14 +1739,43 @@ function loadCsvFile(path){
     if(!raw||!raw.length){ setStatus("Empty / unparseable CSV","err"); return; }
     var idx={}, head=raw[0];
     for(var h=0;h<head.length;h++) idx[trimStr(head[h])]=h;
-    if(("TaskPath" in idx) && ("ActionCommands" in idx) && ("RunAs" in idx))
-      ingestTasks(raw, idx, baseName(path));
+    if(("TaskPath" in idx) && ("ActionCommands" in idx) && ("RunAs" in idx)){
+      loadEventSidecar(path);
+      ingestTasks(raw, idx, baseName(path)); }
     else
       ingestGeneric(raw, head, baseName(path));
   }catch(e){ setStatus("Could not read CSV: "+e.message,"err"); }
 }
 function cell(rw,i){ return (i!=null&&i>=0&&i<rw.length)?rw[i]:""; }
 function numv(v){ var x=parseFloat(v); return isFinite(x)?x:0; }
+/* the companion <stamp>_SchedTasks_Events.csv beside an output CSV -> per-task event history for the detail pane
+   (key = Windows dir + normalized task path, so two hosts in one CSV never share a history) */
+var EVTMAP={}, EVTINFO=null;
+function evtKey(wd, task){ return String(wd||"").toLowerCase()+"|"+normTaskPath(task); }
+function rowWinKey(rec){ return String(windowsDirOf(rec.TasksRoot)||rec.TasksRoot||"").toLowerCase(); }
+function loadEventSidecar(path){
+  EVTMAP={}; EVTINFO=null;
+  var m=baseName(path).match(/^(\d{14})_SchedTasks_Output\.csv$/i); if(!m) return;
+  var ep=parentDir(path)+"\\"+m[1]+"_SchedTasks_Events.csv"; if(!fileExists(ep)) return;
+  try{ var raw=parseCSV(readUtf8(ep)), idx=headIdx(raw[0]||[]), i, n=0, lo="", hi="", logs={};
+    for(i=1;i<raw.length;i++){ var r=raw[i]; if(r.length<5) continue;
+      var e={ts:cell(r,idx.TimeUtc), id:cell(r,idx.EventId), meaning:cell(r,idx.Meaning), log:cell(r,idx.Log), task:cell(r,idx.TaskName), user:cell(r,idx.User),
+        action:cell(r,idx.Action), inst:cell(r,idx.InstanceId), pid:cell(r,idx.ProcessId), res:cell(r,idx.ResultCode), wd:cell(r,idx.WinDir)};
+      var k=evtKey(e.wd, e.task); (EVTMAP[k]=EVTMAP[k]||[]).push(e); n++; logs[e.log]=1;
+      if(e.ts){ if(!lo || e.ts<lo) lo=e.ts; if(!hi || e.ts>hi) hi=e.ts; } }
+    var ll=[], q; for(q in logs){ if(logs.hasOwnProperty(q)) ll.push(q); }
+    EVTINFO={n:n, lo:lo.substring(0,19), hi:hi.substring(0,19), file:baseName(ep), logs:ll.join(" + ")};
+  }catch(e){ appendLog("Could not read the event companion CSV "+ep+": "+e.message); }
+}
+function updateEvtNote(){
+  var el=$("evtNote"); if(!el) return;
+  var n=0, d=0, i; for(i=0;i<ROWS.length;i++){ if(ROWS[i].EvtStatus){ n++; if(hasTag(ROWS[i],"EVTDELETED")) d++; } }
+  if(!n && !EVTINFO){ el.innerHTML=""; showEl("evtNote",false); return; }
+  el.innerHTML="Event log: "+(EVTINFO?(esc(EVTINFO.logs)+" task events "+esc(EVTINFO.lo)+" &rarr; "+esc(EVTINFO.hi)+" UTC ("+nf(EVTINFO.n)+" events, "+esc(EVTINFO.file)+")"):"companion _SchedTasks_Events.csv not found beside this CSV - per-task history unavailable")
+    +" &middot; "+nf(n)+" task(s) seen in it"+(d?(", <b>"+nf(d)+" deleted and gone</b>"):"")
+    +". Tasks registered, run or deleted before the log's first event are not in it - absence from the log proves nothing.";
+  showEl("evtNote",true);
+}
 
 /* ---------- scheduled-task ingest (columns = CSVCOLS, written by this app) ---------- */
 function folderKey(p){ var parts=String(p||"").split("\\");
@@ -1413,10 +1806,13 @@ function ingestTasks(raw, idx, srcLabel){
     rec.ms=msOf(rec.ChangedUtc); rec.day=dayOf(rec.ChangedUtc);
     rec.user=rec.RunAs||"(unknown)";
     rec.repSecs=isoDurSecs(rec.MinRepetition);
-    rec.cmds=splitCmds(rec.ActionCommands).concat(splitCmds(rec.RegActionCommands));
+    // every image the task is known to launch: XML definition, TaskCache copy, and what the event log saw it run
+    rec.cmds=splitCmds(rec.ActionCommands).concat(splitCmds(rec.RegActionCommands)).concat(splitCmds(rec.EvtActions));
     rec.actRaw=rec.AllActions+(rec.RegActions && rec.RegActions!==rec.AllActions?(" || "+rec.RegActions):"");
     rec.actL=rec.actRaw.toLowerCase();
-    rec.iocBlob=[rec.TaskPath,rec.Author,rec.Description,rec.RunAs,rec.AllActions,rec.WorkingDir,rec.ComClassId,rec.ComData,rec.RegActions,rec.Source].join(" ").toLowerCase();
+    rec.wk=rowWinKey(rec);
+    rec.iocBlob=[rec.TaskPath,rec.Author,rec.Description,rec.RunAs,rec.AllActions,rec.WorkingDir,rec.ComClassId,rec.ComData,rec.RegActions,rec.Source,
+      rec.EvtActions,rec.EvtRegisteredBy,rec.EvtDeletedBy].join(" ").toLowerCase();
     var bl=[]; for(c=0;c<CSVCOLS.length;c++) bl.push(rec[CSVCOLS[c]]);
     rec.blob=bl.join(" ").toLowerCase();
     rec.tags=[]; rec.reasons=[]; rec.score=0; rec.sus=false;
@@ -1438,7 +1834,7 @@ function ingestTasks(raw, idx, srcLabel){
   $("srcpill").innerHTML=nf(ROWS.length)+" tasks &middot; "+nf(nRoot)+" root(s) &middot; "+esc(srcLabel);
   // the case window marks rows, it does not pre-filter them (v0.1.1): start with every task visible
   QUERY=""; $("q").value=""; DFROM=0; DTO=0; $("dfrom").value=""; $("dto").value="";
-  updateCaseChip(); updateSdWarn();
+  updateCaseChip(); updateSdWarn(); updateEvtNote();
   CURCAT="all"; highlightCat(); updateFolderChip();
   SORTKEY=0; SORTDIR=1; TSORTKEY=0; TSORTDIR=-1; CSORTKEY=4; CSORTDIR=-1;
   setView("tasks", true);
@@ -1451,8 +1847,9 @@ function updateSdWarn(){
   var el=$("sdWarn"); if(!el) return;
   var n=0, i; for(i=0;i<ROWS.length;i++){ if(ROWS[i].TreeSD==="unknown") n++; }
   if(!n){ el.innerHTML=""; showEl("sdWarn",false); return; }
-  el.innerHTML="&#9888; "+nf(n)+" task(s) come from a host where most TaskCache entries have no SD value. That is a data problem (e.g. a sparse or partial hive copy), not "
-    +"a mass of hidden tasks, so the hidden-task check (NOSD) was not applied to them - they carry the SD-UNKNOWN tag instead. The other TaskCache findings are unaffected.";
+  el.innerHTML="&#9888; "+nf(n)+" task(s) come from a host where most TaskCache entries have no SD value. That is the hive, not a mass of hidden tasks - the Windows 7 / "
+    +"Server 2008 R2 TaskCache layout has no SD values at all (nor Actions), and a sparse or partial hive copy can drop them - so the hidden-task check (NOSD) was not applied "
+    +"to them; they carry the SD-UNKNOWN tag instead. The other TaskCache findings are unaffected.";
   showEl("sdWarn",true);
 }
 function populateTagSel(){
@@ -1480,7 +1877,7 @@ function updateSkewNote(){
   } else { el.innerHTML=""; showEl("skewWarn",false); }
 }
 
-/* ---------- suspicion scoring (spec section 7, T1-T14; flagged = score >= 3) ----------
+/* ---------- suspicion scoring (spec section 7, T1-T17; flagged = score >= 3) ----------
    the case window NEVER scores (family rule). \Microsoft\ tasks are half-weighted on the two noisiest
    rules (T2 LOLBIN, T5 USERPATH) - not exempt, because attackers hide tasks there. */
 function isUserPath(pL){
@@ -1522,6 +1919,7 @@ function actMismatch(r){
   return normAct(r.AllActions)!==normAct(r.RegActions);
 }
 function rescoreAll(){ for(var i=0;i<ROWS.length;i++) scoreRec(ROWS[i]); }
+function fmtGap(s){ return (s<1)?"under a second":((s<90)?(Math.round(s)+" s"):(Math.round(s/60)+" min")); }
 function scoreRec(r){
   var tags=[], reasons=[], score=0, ms=r.inMs, non=!ms, i;
   function add(n,tag,why){ score+=n; tags.push(tag); reasons.push(why+" (+"+n+")"); }
@@ -1559,7 +1957,7 @@ function scoreRec(r){
   if(/\\syswow64\\tasks$/i.test(r.TasksRoot)) add(2,"WOW64","Task file under SysWOW64\\Tasks - the scheduler never writes there");
   // T11-T14 TaskCache cross-check
   var rs=r.RegStatus;
-  if(r.TreeSD==="no" && rs!=="deleted") add(3,"NOSD","TaskCache Tree key has no SD value - hidden from schtasks and the Task Scheduler UI (Tarrask technique)");
+  if(r.TreeSD==="no" && (rs==="matched" || rs==="reg-only")) add(3,"NOSD","TaskCache Tree key has no SD value - hidden from schtasks and the Task Scheduler UI (Tarrask technique)");
   else if(r.TreeSD==="unknown") info("SD-UNKNOWN","Most of this host's TaskCache entries have no SD value, so a missing SD here is a data issue, not evidence of hiding - the NOSD check was not applied");
   if(rs==="reg-only") add(2,"REGONLY","Registered in TaskCache but the task XML is missing - still runs, invisible to anyone reading the Tasks folder");
   else if(rs==="tree-only"){
@@ -1569,10 +1967,22 @@ function scoreRec(r){
     if(ms && r.TreeIndex==="0") info("STALE","Stale Microsoft TaskCache Tree entry (Index 0, no Tasks key, no XML) - normal upgrade leftover");
     else add(ms?2:3,"TREEONLY","TaskCache Tree entry left behind with no Tasks key and no XML - residue of a "+(ms?"":"non-Microsoft ")+"task removed outside a normal delete (its name and Tree LastWrite are all that remain)"); }
   else if(rs==="xml-only") add(1,"XMLONLY","Task XML is not registered in TaskCache - dropped file, cleaned registry, or the hive copy predates it");
-  else if(rs==="deleted") add(1,"REGDELETED","Deleted task recovered from the SOFTWARE hive (registry slack)");
+  else if(rs==="regback-only") add(ms?1:2,"REGBACK","Registered in the RegBack copy of the SOFTWARE hive ("+(r.RegBackUtc||"backup time unknown")+") but gone from the current hive and the Tasks folder - removed after that backup"+(ms?" (Microsoft tree - half weight)":""));
+  else if(rs==="deleted") add(1,"REGDELETED","Deleted task recovered from "+(/\\regback\\/i.test(r.SourceFile)?"the RegBack copy of the SOFTWARE hive":"the SOFTWARE hive")+" (registry slack)");
   if(actMismatch(r)) add(2,"ACTMISMATCH","TaskCache's copy of the actions differs from the task XML");
+  // T15-T17 event log (TaskScheduler/Operational, Security 4698-4702). "Gone" = no XML and no live registration now.
+  var gone=(r.ParseStatus==="no-xml" && rs!=="reg-only");
+  if(r.EvtStatus==="deleted" && gone){
+    // Windows / Office / browser updaters delete their own tasks routinely: deletion alone is +1, +0 in the Microsoft tree
+    (ms?info:function(tg,why){ add(1,tg,why); })("EVTDELETED","Deleted per the event log ("+r.EvtDeletedUtc+" UTC"+(r.EvtDeletedBy?(" by "+r.EvtDeletedBy):"")+") and gone from disk and the current hive"+(ms?" (Microsoft tree - context only)":""));
+    var gap=parseFloat(r.EvtDeleteGapSecs);
+    if(!isNaN(gap) && gap<=QUICKDEL_SECS) add(ms?1:2,"QUICKDEL","Registered, run and deleted in "+fmtGap(gap)+" by an account other than the one it ran as - the register-run-delete shape of remote execution (atexec, schtasks /create /run /delete)"+(ms?" (Microsoft tree - half weight)":""));
+    var sg=parseFloat(r.EvtSelfDeleteGapSecs);
+    if(!(gap<=QUICKDEL_SECS) && !isNaN(sg) && sg<=QUICKDEL_SECS) info("SELFDEL","Registered, run and deleted in "+fmtGap(sg)+" by the account it ran as - how installers and Windows helpers clean up after themselves"); }
+  else if(r.EvtStatus && gone && !rs) add(1,"EVTONLY","Known only from the event log - no XML, no TaskCache entry and no logged deletion");
+  if(r.EvtDefinition) info("EVTDEF","Task definition recovered from the Security log ("+r.EvtDefinition+" TaskContent) - no XML survives");
   // tag-only context (+0) - candidates to promote after tuning
-  if((+r.ActionCount||0)>1) info("MULTI","Task has "+r.ActionCount+" actions");
+  if((+r.ActionCount||0)>1 && !/ \[event log\]/.test(r.AllActions)) info("MULTI","Task has "+r.ActionCount+" actions");   // images seen in the log ran at different times
   if(r.ActionType==="ComHandler") info("COM","COM-handler action (CLSID "+r.ComClassId+")");
   if(r.Enabled==="false") info("DISABLED","Task is disabled");
   if(non && /^[^\\\s]+\\[^\\]+$/.test(r.Author) && !/^(nt authority|microsoft corporation)\\/i.test(r.Author)) info("ACCT-AUTHOR","Author is a DOMAIN\\user account ("+r.Author+")");
@@ -1599,21 +2009,28 @@ function fmtShortTs(s){ var m=String(s).match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d
 function msToTs(ms){ var d=new Date(ms); function p(x){return (x<10?"0":"")+x;}
   return d.getUTCFullYear()+"-"+p(d.getUTCMonth()+1)+"-"+p(d.getUTCDate())+" "+p(d.getUTCHours())+":"+p(d.getUTCMinutes())+":"+p(d.getUTCSeconds()); }
 function hasTag(r,t){ for(var i=0;i<r.tags.length;i++){ if(r.tags[i]===t) return true; } return false; }
-var REGTAGS={NOSD:1,REGONLY:1,TREEONLY:1,XMLONLY:1,REGDELETED:1,ACTMISMATCH:1};
+var REGTAGS={NOSD:1,REGONLY:1,TREEONLY:1,XMLONLY:1,REGDELETED:1,REGBACK:1,ACTMISMATCH:1};
 function hasRegTag(r){ for(var i=0;i<r.tags.length;i++){ if(REGTAGS[r.tags[i]]) return true; } return false; }
+var EVTTAGS={EVTDELETED:1,QUICKDEL:1,EVTONLY:1};
+function hasEvtTag(r){ for(var i=0;i<r.tags.length;i++){ if(EVTTAGS[r.tags[i]]) return true; } return false; }
 function renderPfAgg(rows){
-  var i, r, users={}, roots={}, nonMs=0, susN=0, iocN=0, maxS=0, minMs=0, maxMs=0, st={};
+  var i, r, users={}, roots={}, nonMs=0, susN=0, iocN=0, maxS=0, minMs=0, maxMs=0, st={}, evN=0, evDel=0, evOnly=0;
   for(i=0;i<rows.length;i++){ r=rows[i];
     users[r.user]=(users[r.user]||0)+1; roots[r.TasksRoot]=1;
     if(!r.inMs) nonMs++; if(r.sus) susN++; if(hasTag(r,"IOC")) iocN++; if(r.score>maxS) maxS=r.score;
     if(r.RegStatus) st[r.RegStatus]=(st[r.RegStatus]||0)+1;
+    if(r.EvtStatus){ evN++; if(hasTag(r,"EVTDELETED")) evDel++; if(r.ParseStatus==="no-xml" && !r.RegStatus) evOnly++; }
     if(r.ms){ if(!minMs||r.ms<minMs) minMs=r.ms; if(r.ms>maxMs) maxMs=r.ms; } }
   var nU=0, nR=0, k; for(k in users){ if(users.hasOwnProperty(k)) nU++; } for(k in roots){ if(roots.hasOwnProperty(k)) nR++; }
   var reg="";
-  if(st.matched||st["xml-only"]||st["reg-only"]||st["tree-only"]||st.deleted)
+  if(st.matched||st["xml-only"]||st["reg-only"]||st["tree-only"]||st.deleted||st["regback-only"])
     reg=stat(nf(st.matched||0),"TaskCache matched")+(st["xml-only"]?stat(nf(st["xml-only"]),"XML only","Task XML with no TaskCache registration"):"")
       +((st["reg-only"]||st["tree-only"])?stat(nf((st["reg-only"]||0)+(st["tree-only"]||0)),"registry only","Registered in TaskCache with no XML on disk (tree-only includes stale Microsoft leftovers)"):"")
-      +(st.deleted?stat(nf(st.deleted),"deleted (recovered)","Deleted tasks recovered from the SOFTWARE hive"):"");
+      +(st["regback-only"]?stat(nf(st["regback-only"]),"RegBack only","Registered in the RegBack copy of the SOFTWARE hive, gone from the current hive and the Tasks folder"):"")
+      +(st.deleted?stat(nf(st.deleted),"deleted (recovered)","Deleted tasks recovered from the SOFTWARE hive or its RegBack copy"):"");
+  if(evN) reg+=stat(nf(evN),"in event log","Tasks with Task Scheduler events (TaskScheduler/Operational, Security 4698-4702)")
+    +(evDel?stat(nf(evDel),"deleted per log","The event log shows them deleted and nothing is left on disk or in the current hive"):"")
+    +(evOnly?stat(nf(evOnly),"log only","Known only from the event log - no XML, no TaskCache entry"):"");
   var rng=minMs?(fmtShortTs(msToTs(minMs))+" -> "+fmtShortTs(msToTs(maxMs))):"-";
   $("statbar").innerHTML=stat(nf(rows.length),"tasks")+stat(nf(nonMs),"non-Microsoft")+stat(nf(susN),"flagged")
     +(IOCS.length?stat(nf(iocN),"IOC hits"):"")+stat(String(maxS),"max score")+stat(nf(nU),"run-as accounts")+(nR>1?stat(nf(nR),"roots"):"")+reg
@@ -1642,12 +2059,19 @@ function stateHtml(r){
   if(rs==="matched") h+='<span class="chip">reg</span>';
   else if(rs) h+='<span class="chip '+(rs==="tree-only"&&hasTag(r,"STALE")?"":"bad")+'">'+esc(rs)+'</span>';
   if(r.ParseStatus && r.ParseStatus!=="ok" && r.ParseStatus!=="no-xml") h+='<span class="chip bad">'+esc(r.ParseStatus)+'</span>';
+  if(r.EvtStatus==="deleted") h+='<span class="chip bad" title="'+esc("Deleted per the event log: "+r.EvtDeletedUtc+" UTC"+(r.EvtDeletedBy?(" by "+r.EvtDeletedBy):""))+'">deleted (log)</span>';
+  else if(r.EvtStatus && r.ParseStatus==="no-xml" && !rs) h+='<span class="chip bad" title="Known only from the event log">log only</span>';
   return h;
 }
-function stateKey(r){ return (r.ParseStatus==="no-xml"?"0":"1")+(r.Enabled==="false"?"0":"1")+(r.Hidden==="true"?"h":"")+r.RegStatus; }
-function srcChip(s){ var m={"vr-metadata":"vr","taskcache-tree":"reg","taskcache-created":"reg","file-extracted":"file?","file":"file"};
-  var t={"vr-metadata":"Velociraptor collection metadata (true UTC file time)","taskcache-tree":"TaskCache Tree key LastWrite (UTC)","taskcache-created":"TaskCache created time (UTC)","file-extracted":"Extracted file time - may carry the unzip box's timezone error","file":"File time from the file system"};
+function stateKey(r){ return (r.ParseStatus==="no-xml"?"0":"1")+(r.Enabled==="false"?"0":"1")+(r.Hidden==="true"?"h":"")+r.RegStatus+r.EvtStatus; }
+function srcChip(s){ var m={"vr-metadata":"vr","taskcache-tree":"reg","taskcache-created":"reg","file-extracted":"file?","file":"file","event-log":"evt"};
+  var t={"vr-metadata":"Velociraptor collection metadata (true UTC file time)","taskcache-tree":"TaskCache Tree key LastWrite (UTC)","taskcache-created":"TaskCache created time (UTC)","file-extracted":"Extracted file time - may carry the unzip box's timezone error","file":"File time from the file system","event-log":"Event log (TaskScheduler/Operational or Security) - for a task that is gone, when it was deleted"};
   return s?(' <span class="chip'+(s==="file-extracted"?" warn":"")+'" title="'+esc(t[s]||s)+'">'+esc(m[s]||s)+'</span>'):""; }
+/* registry time first, else what the event log recorded (marked evt) */
+function lastRun(r){ return r.RegLastStartUtc||r.EvtLastRunUtc||""; }
+function lastRunHtml(r){ return esc(lastRun(r))+((!r.RegLastStartUtc && r.EvtLastRunUtc)?' <span class="chip" title="From the event log ('+esc(r.EvtRuns)+' run(s) logged)">evt</span>':""); }
+function regTime(r){ return r.RegCreatedUtc||r.EvtRegisteredUtc||""; }
+function regTimeHtml(r){ return esc(regTime(r))+((!r.RegCreatedUtc && r.EvtRegisteredUtc)?' <span class="chip" title="First registration in the event log'+(r.EvtRegisteredBy?(" (by "+esc(r.EvtRegisteredBy)+")"):"")+'">evt</span>':""); }
 var COLS=[
   {h:"Tags", sk:function(r){return -r.score*10+(r.inMs?1:0);}, cell:function(r){return '<td class="first">'+tagHtml(r)+'</td>';}},
   {h:"Task path", sk:function(r){return r.pathL;}, cell:function(r){return '<td class="mono'+(r.inMs?' muted':'')+'" title="'+esc(r.TaskPath)+'">'+esc(r.TaskPath)+'</td>';}},
@@ -1656,7 +2080,7 @@ var COLS=[
   {h:"Triggers", sk:function(r){return String(r.TriggerSummary).toLowerCase();}, cell:function(r){return '<td class="mono" title="'+esc(r.TriggerSummary)+'">'+esc(r.TriggerSummary)+'</td>';}},
   {h:"State", sk:stateKey, cell:function(r){return '<td>'+stateHtml(r)+'</td>';}},
   {h:"Author", sk:function(r){return String(r.Author).toLowerCase();}, cell:function(r){return '<td class="mono muted" title="'+esc(r.Author)+'">'+esc(r.Author)+'</td>';}},
-  {h:"Last run (UTC)", sk:function(r){return msOf(r.RegLastStartUtc);}, cell:function(r){return '<td class="mono">'+esc(r.RegLastStartUtc)+'</td>';}},
+  {h:"Last run (UTC)", sk:function(r){return msOf(lastRun(r));}, cell:function(r){return '<td class="mono">'+lastRunHtml(r)+'</td>';}},
   {h:"Changed (UTC)", sk:function(r){return r.ms;}, cell:function(r){return '<td class="mono">'+esc(r.ChangedUtc)+srcChip(r.ChangedSource)+caseMark(r)+'</td>';}}
 ];
 function tagHtml(r){
@@ -1664,7 +2088,7 @@ function tagHtml(r){
   if(r.sus) t+='<span class="tag sus" title="'+why+'">SUS '+r.score+'</span>';
   for(i=0;i<r.tags.length;i++){ var g=r.tags[i], cls="gen";
     if(g==="IOC") cls="ioc"; else if(g==="USERPATH") cls="usr"; else if(g==="LOLBIN"||g==="CRADLE"||g==="REMOTE") cls="lol";
-    else if(REGTAGS[g]) cls="reg"; else if(g==="ONESHOT"||g==="BEACON"||g==="HIDDEN") cls="rare";
+    else if(REGTAGS[g]) cls="reg"; else if(EVTTAGS[g]) cls="evt"; else if(g==="ONESHOT"||g==="BEACON"||g==="HIDDEN") cls="rare";
     else if(g==="STALE"||g==="DISABLED") cls="off";
     t+='<span class="tag '+cls+'" title="'+why+'">'+esc(g)+'</span>'; }
   return t;
@@ -1685,6 +2109,7 @@ function filteredPf(){
     if(CURCAT==="hidden"&&r.Hidden!=="true") continue;
     if(CURCAT==="disabled"&&r.Enabled!=="false") continue;
     if(CURCAT==="reg"&&!hasRegTag(r)) continue;
+    if(CURCAT==="evt"&&!hasEvtTag(r)) continue;
     if(QUERY){ if(r.blob.indexOf(QUERY)<0) continue; }
     if((DFROM&&(!r.day||r.day<DFROM)) || (DTO&&(!r.day||r.day>DTO))){ hidden++; if(r.sus) hiddenSus++; continue; }   // counted, never silently dropped
     out.push(r);
@@ -1717,11 +2142,11 @@ function updateCaseChip(){
 }
 function caseMark(r){ return inCaseWindow(r)?' <span class="chip warn" title="Changed inside the case window">in window</span>':""; }
 function updateCatCounts(){
-  var c={all:ROWS.length,sus:0,nonms:0,ioc:0,exec:0,com:0,hidden:0,disabled:0,reg:0};
+  var c={all:ROWS.length,sus:0,nonms:0,ioc:0,exec:0,com:0,hidden:0,disabled:0,reg:0,evt:0};
   for(var i=0;i<ROWS.length;i++){ var r=ROWS[i];
     if(r.sus)c.sus++; if(!r.inMs)c.nonms++; if(hasTag(r,"IOC"))c.ioc++; if(r.ActionType==="Exec"||r.cmds.length)c.exec++;
-    if(hasTag(r,"COM"))c.com++; if(r.Hidden==="true")c.hidden++; if(r.Enabled==="false")c.disabled++; if(hasRegTag(r))c.reg++; }
-  var names={all:"All",sus:"Flagged",nonms:"Non-Microsoft",ioc:"IOC hits",exec:"Exec",com:"COM handler",hidden:"Hidden",disabled:"Disabled",reg:"Registry anomalies"};
+    if(hasTag(r,"COM"))c.com++; if(r.Hidden==="true")c.hidden++; if(r.Enabled==="false")c.disabled++; if(hasRegTag(r))c.reg++; if(hasEvtTag(r))c.evt++; }
+  var names={all:"All",sus:"Flagged",nonms:"Non-Microsoft",ioc:"IOC hits",exec:"Exec",com:"COM handler",hidden:"Hidden",disabled:"Disabled",reg:"Registry anomalies",evt:"Event-log findings"};
   var bs=$("pfCats").getElementsByTagName("button");
   for(var j=0;j<bs.length;j++){ var k=bs[j].getAttribute("data-cat");
     if(k) bs[j].innerHTML=names[k]+" ("+nf(c[k])+")"; }
@@ -1888,8 +2313,8 @@ var TCOLS=[
   {h:"Task path", sk:function(r){return r.pathL;}, cell:function(r){return '<td class="mono'+(r.inMs?' muted':'')+'" title="'+esc(r.TaskPath)+'">'+esc(r.TaskPath)+'</td>';}},
   {h:"Action", sk:function(r){return r.actL;}, cell:function(r){return '<td class="mono" title="'+esc(r.AllActions)+'">'+esc(actionText(r))+'</td>';}},
   {h:"Run as", sk:function(r){return r.user.toLowerCase();}, cell:function(r){return '<td class="mono lnk" data-user="'+esc(r.user)+'" title="click to filter to this account">'+esc(r.user)+'</td>';}},
-  {h:"Registered (UTC)", sk:function(r){return msOf(r.RegCreatedUtc);}, cell:function(r){return '<td class="mono" title="TaskCache created time">'+esc(r.RegCreatedUtc)+'</td>';}},
-  {h:"Last run (UTC)", sk:function(r){return msOf(r.RegLastStartUtc);}, cell:function(r){return '<td class="mono">'+esc(r.RegLastStartUtc)+'</td>';}},
+  {h:"Registered (UTC)", sk:function(r){return msOf(regTime(r));}, cell:function(r){return '<td class="mono" title="TaskCache created time, else the first registration in the event log">'+regTimeHtml(r)+'</td>';}},
+  {h:"Last run (UTC)", sk:function(r){return msOf(lastRun(r));}, cell:function(r){return '<td class="mono">'+lastRunHtml(r)+'</td>';}},
   {h:"RegDate (host-local)", sk:function(r){return String(r.RegDate);}, cell:function(r){return '<td class="mono muted" title="RegistrationInfo/Date as written in the XML - host-local unless it carries Z / an offset; usually absent">'+esc(r.RegDate)+'</td>';}}
 ];
 function renderTime(){
@@ -2020,7 +2445,10 @@ function renderDetail(rec){
   if(rec.reasons.length){ h+='<div style="font-size:12px;color:#ff9b9b;margin-bottom:6px">';
     for(i=0;i<rec.reasons.length;i++) h+="&bull; "+esc(rec.reasons[i])+"<br>"; h+='</div>'; }
   h+='<div style="word-wrap:break-word">';
-  h+='<div class="dsec">Actions'+(rec.ParseStatus==="no-xml"?" (decoded from the TaskCache registry copy)":"")+'</div>';
+  var asrc="";
+  if(rec.ParseStatus==="no-xml") asrc=rec.EvtDefinition?(" (from the Security log's copy of the task XML - event "+rec.EvtDefinition+")")
+    :(rec.RegActions?(" (decoded from the TaskCache registry copy"+(/\[RegBack\]/.test(rec.RegActions)?" in RegBack":"")+")"):(rec.EvtActions?" (what the event log saw it run - the definition itself did not survive)":""));
+  h+='<div class="dsec">Actions'+esc(asrc)+'</div>';
   var acts=String(rec.AllActions||"").split(" || ");
   for(i=0;i<acts.length;i++) h+=detRow("Action "+(i+1), acts[i], true);
   if(rec.RegActions && rec.ParseStatus!=="no-xml"){
@@ -2040,7 +2468,19 @@ function renderDetail(rec){
     h+='<div class="dsec">TaskCache (SOFTWARE hive)</div>';
     h+=detRow("Status", rec.RegStatus, true)+detRow("Task GUID", rec.RegGuid, true)+detRow("Created (UTC)", rec.RegCreatedUtc, true);
     h+=detRow("Last start (UTC)", rec.RegLastStartUtc, true)+detRow("Last stop (UTC)", rec.RegLastStopUtc, true)+detRow("Last result", rec.RegLastResult, true);
-    h+=detRow("Task state", rec.RegTaskState, true)+detRow("Tree key LastWrite", rec.TreeLastWriteUtc, true)+detRow("Tree Index", rec.TreeIndex, true)+detRow("Tree SD present", rec.TreeSD, true); }
+    h+=detRow("Task state", rec.RegTaskState, true)+detRow("Tree key LastWrite", rec.TreeLastWriteUtc, true)+detRow("Tree Index", rec.TreeIndex, true)+detRow("Tree SD present", rec.TreeSD, true);
+    h+=detRow("RegBack copy", rec.RegBackStatus?(rec.RegBackStatus+(rec.RegBackUtc?("  (backup taken "+rec.RegBackUtc+")"):"")):"", true); }
+  if(rec.EvtStatus){
+    h+='<div class="dsec">Event log (TaskScheduler/Operational, Security 4698-4702)</div>';
+    h+=detRow("Status", rec.EvtStatus+(rec.EvtEvents?("  ("+rec.EvtEvents+" events)"):""), true);
+    h+=detRow("First registered", rec.EvtRegisteredUtc?(rec.EvtRegisteredUtc+" UTC"+(rec.EvtRegisteredBy?("  by "+rec.EvtRegisteredBy):"")):"", true);
+    h+=detRow("Last updated", rec.EvtUpdatedUtc?(rec.EvtUpdatedUtc+" UTC"):"", true);
+    h+=detRow("Deleted", rec.EvtDeletedUtc?(rec.EvtDeletedUtc+" UTC"+(rec.EvtDeletedBy?("  by "+rec.EvtDeletedBy):"")):"", true);
+    h+=detRow("Register-run-delete", rec.EvtDeleteGapSecs?("deleted "+fmtGap(parseFloat(rec.EvtDeleteGapSecs))+" after a (re-)registration it ran under - by another account"):"", true);
+    h+=detRow("Self-deleted", rec.EvtSelfDeleteGapSecs?("deleted "+fmtGap(parseFloat(rec.EvtSelfDeleteGapSecs))+" after a (re-)registration it ran under - by the account it ran as"):"", true);
+    h+=detRow("Runs logged", (rec.EvtRuns && rec.EvtRuns!=="0")?(rec.EvtRuns+"  ("+rec.EvtFirstRunUtc+" -> "+rec.EvtLastRunUtc+" UTC)"):"", true);
+    var ims=splitCmds(rec.EvtActions); for(i=0;i<ims.length;i++) h+=detRow("Launched "+(i+1), ims[i], true);
+    h+=evtListHtml(rec); }
   h+='<div class="dsec">Times &amp; files</div>';
   h+=detRow("Changed (UTC)", rec.ChangedUtc+(rec.ChangedSource?("  ["+rec.ChangedSource+"]"):""), true);
   h+=detRow("File created (UTC)", rec.FileCreatedUtc, true)+detRow("File modified (UTC)", rec.FileModifiedUtc+(rec.FileTimeSource?("  ["+rec.FileTimeSource+"]"):""), true);
@@ -2054,6 +2494,18 @@ function renderDetail(rec){
   $("detBody").innerHTML=h;
   showEl("detailCard",true);
 }
+/* the task's own event history (companion CSV): every value is evidence - escaped; lifecycle rows highlighted */
+function evtListHtml(rec){
+  var evs=EVTMAP[evtKey(rec.wk, rec.TaskPath)];
+  if(!evs || !evs.length) return '<div class="muted" style="font-size:11px">'+(EVTINFO?"No events for this task in the companion events CSV.":"Per-event history: load the output CSV that has its companion _SchedTasks_Events.csv beside it.")+'</div>';
+  var start=Math.max(0, evs.length-400), h='<div class="evscroll"><table class="evl">', i;
+  if(start) h+='<tr><td colspan="5" class="muted">'+nf(start)+' older event(s) not shown - see '+esc(EVTINFO?EVTINFO.file:"the events CSV")+'</td></tr>';
+  for(i=start;i<evs.length;i++){ var e=evs[i], id=+e.id, life=(id===106||id===140||id===141||id===4698||id===4699||id===4702);
+    var extra=e.action+(e.pid?("  pid "+e.pid):"")+((e.res && e.res!=="0")?("  result "+resultHex(e.res)):"");
+    h+='<tr'+((id===141||id===4699)?' class="del"':'')+'><td class="mono">'+esc(e.ts)+'</td><td class="mono'+(life?'':' muted')+'">'+esc(e.id)+'</td><td'+(life?'':' class="muted"')+'>'+esc(e.meaning)
+      +'</td><td class="mono">'+esc(e.user)+'</td><td class="mono '+hlClassFor(String(extra).toLowerCase())+'">'+esc(extra)+'</td></tr>'; }
+  return h+'</table></div>';
+}
 function closeDetail(){ DETREC=null; showEl("detailCard",false); $("detBody").innerHTML=""; }
 function copyDetail(){
   if(!DETREC){ setStatus("No record open","err"); return; }
@@ -2066,6 +2518,10 @@ function copyDetail(){
   if(r.RegActions && normAct(r.RegActions)!==normAct(r.AllActions)) out.push("TaskCache actions: "+r.RegActions);
   out.push("triggers: "+r.TriggerSummary);
   out.push("changed "+r.ChangedUtc+" UTC ("+(r.ChangedSource||"?")+")"+(r.RegCreatedUtc?("   registered "+r.RegCreatedUtc+" UTC"):"")+(r.RegLastStartUtc?("   last run "+r.RegLastStartUtc+" UTC"):""));
+  if(r.RegBackStatus) out.push("RegBack copy: "+r.RegBackStatus+(r.RegBackUtc?(" (backup "+r.RegBackUtc+")"):""));
+  if(r.EvtStatus) out.push("event log: "+r.EvtStatus+(r.EvtRegisteredUtc?("; first registered "+r.EvtRegisteredUtc+" UTC by "+(r.EvtRegisteredBy||"?")):"")
+    +(r.EvtDeletedUtc?("; deleted "+r.EvtDeletedUtc+" UTC by "+(r.EvtDeletedBy||"?")+(r.EvtDeleteGapSecs?(" ("+fmtGap(parseFloat(r.EvtDeleteGapSecs))+" after a registration it ran under)"):"")):"")
+    +((r.EvtRuns && r.EvtRuns!=="0")?("; "+r.EvtRuns+" run(s) "+r.EvtFirstRunUtc+" -> "+r.EvtLastRunUtc+" UTC"):"")+(r.EvtActions?("; launched "+r.EvtActions):""));
   out.push("source: "+r.SourceFile);
   try{ window.clipboardData.setData("Text", out.join("\r\n")); setStatus("Record copied to clipboard","ok"); }
   catch(e){ setStatus("Copy failed: "+e.message,"err"); }
@@ -2126,7 +2582,7 @@ function setMode(m){
   MODE=m; var pf=(m==="tasks");
   showEl("pfCards",pf); showEl("pfCats",pf); showEl("pfDateCtl",pf); showEl("pfFoot",pf);
   showEl("iocBtn",pf); showEl("viewToggle",pf);
-  if(!pf){ showEl("iocWrap",false); closeDetail(); showEl("userWrap",false); showEl("tagWrap",false); showEl("rootWrap",false); showEl("folderChip",false); showEl("skewWarn",false); showEl("sdWarn",false); showEl("dateWarn",false); showEl("caseChip",false); }
+  if(!pf){ showEl("iocWrap",false); closeDetail(); showEl("userWrap",false); showEl("tagWrap",false); showEl("rootWrap",false); showEl("folderChip",false); showEl("skewWarn",false); showEl("sdWarn",false); showEl("evtNote",false); showEl("dateWarn",false); showEl("caseChip",false); }
   if(pf) showEl("srcWrap",false);
   $("ovTitle").innerHTML = pf ? "Overview &mdash; reflects active filters" : "Overview";
   $("tableTitle").innerHTML = pf ? viewTitle(VIEW) : "Records";
@@ -2189,7 +2645,8 @@ function copyNotes(){
   } else {
     for(i=0;i<rows.length;i++){ var r=rows[i];
       out.push((r.ChangedUtc||"(no time)")+" UTC | "+(r.tags.length?(r.score+" "+r.tags.join(",")):"0")+" | "+r.TaskPath+" | "+(r.RunAs||"(unknown)")+" | "+actionText(r)
-        +(r.RegStatus && r.RegStatus!=="matched"?(" | TaskCache: "+r.RegStatus):"")); }
+        +(r.RegStatus && r.RegStatus!=="matched"?(" | TaskCache: "+r.RegStatus):"")
+        +(r.EvtStatus==="deleted"?(" | event log: deleted "+r.EvtDeletedUtc+" UTC by "+(r.EvtDeletedBy||"?")+((r.EvtRuns && r.EvtRuns!=="0")?(", ran "+r.EvtRuns+"x"):"")):"")); }
   }
   try{ window.clipboardData.setData("Text", out.join("\r\n")); setStatus("Copied "+out.length+" rows to clipboard"+copyCapNote(window.__viewRows),"ok"); }
   catch(e){ setStatus("Copy failed: "+e.message,"err"); }
@@ -2479,11 +2936,12 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
     <span class="x" onclick="closeHelp()" title="Close">&times;</span>
     <h2>SchedTasks Analyzer <span class="muted" style="font-size:13px;font-weight:400" id="helpVer"></span></h2>
     <div class="gh muted">GitHub: <span class="lnk" onclick="openUrl(GITHUB)">https://github.com/bpmorris22/SchedTasks-Analyzer</span></div>
-    <p>A single-file GUI for <b>Windows scheduled-task triage</b> &mdash; what is registered to run on a host, as whom, launching what, and which of it looks like persistence or lateral movement. It parses the Task Scheduler XML under <code>Windows\System32\Tasks</code> itself (no external parser), cross-checks it against the SOFTWARE hive's <b>TaskCache</b> keys with Eric Zimmerman's RECmd when the hive is collected, and writes one CSV that opens in a scored triage view.</p>
+    <p>A single-file GUI for <b>Windows scheduled-task triage</b> &mdash; what is registered to run on a host, as whom, launching what, and which of it looks like persistence or lateral movement. It parses the Task Scheduler XML under <code>Windows\System32\Tasks</code> itself (no external parser), cross-checks it against the SOFTWARE hive's <b>TaskCache</b> keys (and the <b>RegBack</b> copy of the hive) with Eric Zimmerman's RECmd when the hive is collected, correlates the <b>Task Scheduler event log</b> (TaskScheduler/Operational, Security 4698-4702) with Windows' own wevtutil, and writes one CSV that opens in a scored triage view.</p>
     <h3>Quick start</h3>
     <ul>
       <li>Point the input at a <b>host or collection folder</b> (every <code>Windows\System32\Tasks</code> below it is found &mdash; Velociraptor/KAPE trees work as-is), a <b>Tasks folder</b>, or a <b>single task file</b>. Then <b>Process &rarr; analyze</b>. A host takes seconds.</li>
       <li>The SOFTWARE hive is found automatically beside each Tasks folder (<code>..\System32\config\SOFTWARE</code>, copied to %TEMP% with its <code>.LOG1/.LOG2</code>). The cross-check needs RECmd: it is found next to this app (<code>RECmd\</code>, shared with RECmd-Wrapper) or in <code>C:\ZimmermanTools</code>; <b>Download RECmd</b> fetches it. Without RECmd the XML triage still runs.</li>
+      <li>The event logs are found the same way (<code>..\System32\winevt\Logs</code>: <code>Microsoft-Windows-TaskScheduler%4Operational.evtx</code> &mdash; <code>%254</code> in Velociraptor trees &mdash; and <code>Security.evtx</code> up to 2 GB), copied to %TEMP% and queried with <code>wevtutil</code>. No extra tool is needed. A run writes a second CSV, <code>&lt;stamp&gt;_SchedTasks_Events.csv</code>, with every task event; keep it beside the output CSV and the detail pane shows each task's event history.</li>
       <li>Or <b>Load existing CSV&hellip;</b> to reopen an earlier output (or view any CSV).</li>
     </ul>
     <h3>Command line</h3>
@@ -2500,8 +2958,9 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
     <ul>
       <li><b>T1 IOC</b> +3 &middot; <b>T2 LOLBIN</b> +2 (script host / LOLBin launcher) &middot; <b>T3 CRADLE</b> +2 (IEX, download cradle, encoded command, hidden window) &middot; <b>T4 REMOTE</b> +2 (URL or UNC share) &middot; <b>T5 USERPATH</b> +2 (AppData, Temp, Public, ProgramData, Tasks folders&hellip;)</li>
       <li>Non-Microsoft tasks only: <b>T6 SYSTEM</b> +1 (SYSTEM / highest privileges) &middot; <b>T7 S4U / PASSWORD</b> +1 &middot; <b>T9 HIDDEN</b> +1, <b>BEACON</b> +1 (repeats every &le; 15 min). <b>T8 ONESHOT</b> +1 (single time trigger ending within 24 h, or delete-after-expiry &mdash; the remote-push shape).</li>
-      <li>Structure: <b>T10 MALFORMED / NOTTASK</b> +2, <b>NOTUTF16</b> +1, <b>WOW64</b> +2 (file under SysWOW64\Tasks), <b>ATJOB</b> +2 / <b>JOB</b> +1 (legacy <code>.job</code>).</li>
-      <li>TaskCache: <b>NOSD</b> +3 (Tree key without its SD value &mdash; hidden from schtasks and the UI, the Tarrask technique; when <i>most</i> of a host's entries lack an SD that is a data problem, so the check is skipped for that host, tagged SD-UNKNOWN and explained in a banner) &middot; <b>REGONLY</b> +2 (registered, no XML on disk) &middot; <b>TREEONLY</b> +3 (a non-Microsoft Tree entry left behind with no Tasks key and no XML &mdash; residue of a task removed outside a normal delete; Microsoft leftovers of that shape are tagged STALE at +0) &middot; <b>XMLONLY</b> +1 (XML not registered) &middot; <b>REGDELETED</b> +1 (deleted task recovered from hive slack, with its actions decoded) &middot; <b>ACTMISMATCH</b> +2 (registry copy of the actions differs from the XML).</li>
+      <li>Structure: <b>T10 MALFORMED / NOTTASK</b> +2, <b>NOTUTF16</b> +1, <b>WOW64</b> +2 (file under SysWOW64\Tasks), <b>ATJOB</b> +3 / <b>JOB</b> +1 (legacy <code>.job</code>).</li>
+      <li>TaskCache: <b>NOSD</b> +3 (a registered task whose Tree key has no SD value &mdash; hidden from schtasks and the UI, the Tarrask technique; when <i>most</i> of a host's entries lack an SD that is a data problem, so the check is skipped for that host, tagged SD-UNKNOWN and explained in a banner) &middot; <b>REGONLY</b> +2 (registered, no XML on disk) &middot; <b>TREEONLY</b> +3 (a non-Microsoft Tree entry left behind with no Tasks key and no XML &mdash; residue of a task removed outside a normal delete; Microsoft leftovers of that shape are tagged STALE at +0) &middot; <b>XMLONLY</b> +1 (XML not registered) &middot; <b>REGBACK</b> +2 (registered in the RegBack copy of the hive but gone from the current hive and the Tasks folder &mdash; removed after that backup) &middot; <b>REGDELETED</b> +1 (deleted task recovered from hive slack &mdash; current hive or RegBack copy &mdash; with its actions decoded where they survive) &middot; <b>ACTMISMATCH</b> +2 (registry copy of the actions differs from the XML).</li>
+      <li>Event log: <b>EVTDELETED</b> +1 (the log shows the task deleted, and nothing is left on disk or in the current hive; context only under <code>\Microsoft\</code>, where Windows deletes its own tasks routinely) &middot; <b>QUICKDEL</b> +2 (registered or updated, run, and deleted within 10 minutes <i>by an account other than the one it ran as</i> &mdash; the register-run-delete shape of atexec / <code>schtasks /create /run /delete</code> remote execution; +1 under <code>\Microsoft\</code>) &middot; <b>EVTONLY</b> +1 (known only from the log, no deletion logged). The images the log saw a task launch (events 129 / 200) are scored by T2 and T5 like any other action. Context tags at +0: <b>SELFDEL</b> (the same quick register-run-delete, but by the account it ran as &mdash; how installers and Windows' own helpers clean up), <b>EVTDEF</b> (the task's full XML was recovered from Security 4698 / 4702).</li>
       <li>Tasks under <code>\Microsoft\</code> score <b>half</b> on T2 and T5 (Windows ships many script-host tasks there) but are <b>never exempt</b> &mdash; attackers hide tasks in that tree. Context tags at +0: MULTI, COM, DISABLED, ACCT-AUTHOR, URIMISMATCH, STALE.</li>
     </ul>
     <h3>Notes</h3>
@@ -2509,7 +2968,8 @@ window.onload=function(){ init(); try{ window.setTimeout(checkSelfUpdate,600); }
       <li>Three views: <b>Tasks</b> (score-ranked), <b>Timeline</b> (by Changed) and <b>Folders</b> (per task folder &mdash; click one to drill in). The <code>run as:</code> dropdown (or clicking a Run-as cell) filters every view to one task principal.</li>
       <li><b>Times.</b> Changed (UTC) comes from the collection's own file metadata when present (Velociraptor <code>results\&hellip;All Matches Metadata.json</code>), else the TaskCache Tree key LastWrite, else the file time. Extracted file times can carry the <b>unzip box's timezone error</b> (Velociraptor offline-collector ZIPs store local DOS times) &mdash; the app detects a consistent offset and says so above the overview. <code>RegDate</code> is copied verbatim from the XML: host-local unless it carries <code>Z</code>, and usually absent.</li>
       <li>This reads the XML <b>on disk</b>. A task hidden by deleting its registry SD still has its XML and still shows here (and the cross-check tags it NOSD). A task whose XML was deleted but which is still registered shows as a registry-only row with its actions decoded from TaskCache.</li>
-      <li>Only tasks present at collection time appear. For created-then-deleted tasks also check TaskScheduler/Operational event 141 and Security 4699 (Hayabusa-Wrapper) and <code>$UsnJrnl</code> (MFTECmd-Wrapper); the TaskCache cross-check recovers some from hive slack.</li>
+      <li><b>Deleted tasks.</b> A task registered, run and deleted (the remote-execution pattern) leaves no XML and usually no TaskCache key. Three things can still name it here: the <b>event log</b> (106 registered, 129 / 200 what it ran, 141 deleted &mdash; with the accounts), the <b>RegBack</b> copy of the hive when the deletion came after the last backup, and deleted keys in hive slack. Such tasks get their own rows; the Actions shown are what the log saw them launch (or the full XML from Security 4698 when object-access auditing was on). The banner above the overview says how far back the log reaches &mdash; a task missing from a short log proves nothing. <code>$UsnJrnl</code> (MFTECmd-Wrapper) can add the XML file's create / delete.</li>
+      <li><b>Windows 7 / Server 2008 R2</b> hives have no SD and no Actions value in TaskCache; RECmd's TaskCache plugin fails on them, so created / last-run times are decoded from each task's DynamicInfo instead. NOSD and ACTMISMATCH do not apply there (SD-UNKNOWN).</li>
       <li>A dirty hive is replayed with its transaction logs; if the logs are missing RECmd re-runs without them and the run says so. The <b>live</b> SOFTWARE hive is locked by Windows, so live runs are XML-only (and need an elevated mshta).</li>
       <li>COM-handler actions are shown as raw CLSIDs; SIDs are raw apart from the well-known ones. Columns are resizable &mdash; drag a header's right edge; double-click to reset.</li>
       <li>CSV values are written unmodified. Arguments can begin with <code>-</code>, <code>+</code>, <code>=</code> or <code>@</code>: open the CSV in this app or Timeline Explorer rather than Excel.</li>

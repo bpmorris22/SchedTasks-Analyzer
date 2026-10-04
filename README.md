@@ -1,6 +1,6 @@
 # SchedTasks-Analyzer
 
-A single-file GUI for **Windows scheduled-task triage** — what is registered to run on a host, as whom, launching what, and which of it looks like persistence or lateral movement. It parses the Task Scheduler XML under `Windows\System32\Tasks` itself, cross-checks it against the SOFTWARE hive's **TaskCache** registry keys with Eric Zimmerman's [RECmd](https://github.com/EricZimmerman/RECmd), and turns both into one suspicion-scored, filterable view. One `.hta`, no install, part of the [DFIR-Windows-Artifact-Finder](https://github.com/bpmorris22/DFIR-Windows-Artifact-Finder) family.
+A single-file GUI for **Windows scheduled-task triage** — what is registered to run on a host, as whom, launching what, and which of it looks like persistence or lateral movement. It parses the Task Scheduler XML under `Windows\System32\Tasks` itself, cross-checks it against the SOFTWARE hive's **TaskCache** registry keys (and the hive's RegBack copy) with Eric Zimmerman's [RECmd](https://github.com/EricZimmerman/RECmd), correlates the **Task Scheduler event log** — so tasks that were registered, run and deleted still show up, with what they launched and who deleted them — and turns all of it into one suspicion-scored, filterable view. One `.hta`, no install, part of the [DFIR-Windows-Artifact-Finder](https://github.com/bpmorris22/DFIR-Windows-Artifact-Finder) family.
 
 ![Tasks view](images/tasks-view.png)
 
@@ -16,7 +16,7 @@ A single-file **[manual](docs/SchedTasks-Analyzer-Manual.html)** covers what the
 2. Point the input at a **host or collection folder** — every `Windows\System32\Tasks`, `SysWOW64\Tasks` and legacy `Windows\Tasks` below it is found (Velociraptor / KAPE trees work as-is) — or at a single Tasks folder or task file.
 3. Confirm the **Target hostname** guess, then **Process → analyze**. A host takes seconds. Or **Load existing CSV…** to reopen an earlier result.
 
-The task XML parser is built in. RECmd is only needed for the registry cross-check: it is found next to the app (`RECmd\`, shared with [RECmd-Wrapper](https://github.com/bpmorris22/RECmd-Wrapper)) or in `C:\ZimmermanTools`, and **Download RECmd** fetches it from the official mirror. Without it the XML triage still runs.
+The task XML parser is built in and the event logs are read with Windows' own `wevtutil`. RECmd is only needed for the registry cross-check: it is found next to the app (`RECmd\`, shared with [RECmd-Wrapper](https://github.com/bpmorris22/RECmd-Wrapper)) or in `C:\ZimmermanTools`, and **Download RECmd** fetches it from the official mirror. Without it the XML triage still runs.
 
 ## What it checks
 
@@ -25,17 +25,19 @@ The task XML parser is built in. RECmd is only needed for the registry cross-che
   - **registry-only** tasks whose XML was deleted, with their actions decoded from the registry;
   - **XML-only** files that were never registered;
   - **Tree-only residue** of tasks removed outside a normal delete;
-  - **deleted** registrations RECmd recovers from the hive;
-  - **hidden tasks** whose Tree key lost its SD value (the "Tarrask" technique) — skipped with a warning on a host where *most* entries lack an SD, which means a partial hive copy rather than tradecraft;
+  - **deleted** registrations RECmd recovers from the hive (including keys that lost their values);
+  - tasks still registered in the hive's **RegBack** copy but gone now — removed after that backup;
+  - **hidden tasks** whose Tree key lost its SD value (the "Tarrask" technique) — skipped with a note on a host where *most* entries lack an SD (a Windows 7 / Server 2008 R2 hive, or a partial hive copy) rather than tradecraft;
   - registry actions that **differ** from the XML;
-  - registered and last-run times.
-- **Trustworthy times** — files unzipped from an offline collection can carry the analysis box's timezone error. Changed (UTC) prefers the collection's own file metadata, then the TaskCache LastWrite, and the app warns when it detects a consistent offset.
+  - registered and last-run times — decoded from each task's `DynamicInfo` too, so Windows 7 / Server 2008 R2 hives (where RECmd's TaskCache plugin fails) keep them.
+- **The event log** — `TaskScheduler/Operational` (registered 106, updated 140, deleted 141, runs 100 / 129 / 200) and Security 4698–4702, queried with `wevtutil`. Every task gets its lifecycle, the accounts that registered and deleted it, its runs and the images it actually launched (scored like any action). A task that exists **only** in the log gets its own row; a quick register-run-delete by an account other than the one the task ran as — the remote-execution shape — is flagged. A companion `<stamp>_SchedTasks_Events.csv` holds every event and feeds each task's history in the detail pane.
+- **Trustworthy times** — files unzipped from an offline collection can carry the analysis box's timezone error. Changed (UTC) prefers the collection's own file metadata, then (for a task that is gone) its deletion in the event log, then the TaskCache LastWrite, and the app warns when it detects a consistent offset.
 
 ![Registry anomalies](images/registry-view.png)
 
 ## Views & scoring
 
-- **Tasks** (score-ranked), **Timeline** (by Changed, UTC) and **Folders** (per task folder), with category chips (Flagged, Non-Microsoft, IOC hits, Exec, COM handler, Hidden, Disabled, Registry anomalies), free-text search, run-as / tag / root filters, a date window, a full detail pane with the raw XML, CSV export and case-note copy.
+- **Tasks** (score-ranked), **Timeline** (by Changed, UTC) and **Folders** (per task folder), with category chips (Flagged, Non-Microsoft, IOC hits, Exec, COM handler, Hidden, Disabled, Registry anomalies, Event-log findings), free-text search, run-as / tag / root filters, a date window, a full detail pane with the raw XML, CSV export and case-note copy.
 - Flagged at score ≥ 3. Signals:
 
   | Signal | Score |
@@ -47,9 +49,10 @@ The task XML parser is built in. RECmd is only needed for the registry cross-che
   | One-shot trigger (the remote-push shape) | +1 |
   | Malformed, non-task or SysWOW64 task files | +1 to +2 |
   | `At<n>.job` | +3 |
-  | TaskCache: no SD +3 · Tree-only residue +3 · registry-only +2 · actions mismatch +2 · XML-only +1 · recovered deleted +1 | as listed |
+  | TaskCache: no SD on a registered task +3 · Tree-only residue +3 · registry-only +2 · RegBack-only +2 · actions mismatch +2 · XML-only +1 · recovered deleted +1 | as listed |
+  | Event log: registered, run and deleted within 10 min by another account +2 · deleted and gone +1 · known only from the log +1 | as listed |
 
-  Tasks under `\Microsoft\` score half on the LOLBin and user-path rules but are never exempt.
+  Tasks under `\Microsoft\` score half on the LOLBin, user-path, RegBack and quick-delete rules (a deletion alone is context only there) but are never exempt.
 
 ![Task detail](images/detail-view.png)
 
@@ -68,8 +71,8 @@ mshta "SchedTasks-Analyzer.hta" "<inputOrCsv>" ["<outDir>"] [/auto] [/from:yyyy-
 
 ## Notes
 
-- **Live machine:** the **This machine** button reads the local Tasks folder, which needs an elevated mshta. Windows keeps the live SOFTWARE hive locked, so live runs are XML-only.
-- Task files and registry keys show what exists at collection time. Pair findings with TaskScheduler/Operational events 106 / 140 / 141 / 200 / 201 and Security 4698–4702 ([Hayabusa-Wrapper](https://github.com/bpmorris22/Hayabusa-Wrapper)), and with `$UsnJrnl` ([MFTECmd-Wrapper](https://github.com/bpmorris22/MFTECmd-Wrapper)).
+- **Live machine:** the **This machine** button reads the local Tasks folder and event logs, which needs an elevated mshta. Windows keeps the live SOFTWARE hive locked, so live runs skip the TaskCache cross-check.
+- **The log is short.** A busy host's TaskScheduler/Operational log holds a few weeks; the banner shows where it starts, and a task older than that is simply not in it. Security logs over 2 GB are not queried — use [Hayabusa-Wrapper](https://github.com/bpmorris22/Hayabusa-Wrapper). Pair findings with logon events for the accounts shown, and with `$UsnJrnl` ([MFTECmd-Wrapper](https://github.com/bpmorris22/MFTECmd-Wrapper)).
 - COM-handler actions are shown as raw CLSIDs; SIDs are raw apart from the well-known ones.
 - CSV values are written unmodified and task arguments can begin with `-`, `+`, `=` or `@` — open the CSV in this app or Timeline Explorer rather than Excel.
 - Requires Windows (mshta / IE-JScript host). Columns are resizable; drag a header edge, double-click to reset.
